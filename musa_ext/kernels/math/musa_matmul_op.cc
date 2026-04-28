@@ -54,7 +54,7 @@ class MusaMatMulOp : public MusaOpKernel {
       if (tf32_env) {
         return std::atoi(tf32_env) != 0;
       }
-      return false;  // Default: TF32 enabled for performance
+      return true;  // Default: TF32 enabled for performance
     }();
     tf32_enabled_ = tf32_enabled_global;
   }
