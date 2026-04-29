@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <memory>
 #include <vector>
 
@@ -366,13 +367,15 @@ struct EinsumHelper {
 
     if (output->NumElements() == 0) return Status::OK();
 
+    static bool tf32_enabled_global = []() {
+      const char* tf32_env = std::getenv("MUSA_ENABLE_TF32");
+      if (tf32_env) {
+        return std::atoi(tf32_env) != 0;
+      }
+      return true;
+    }();
     auto& handle = GetHandleByCtx(ctx);
-    handle.SetAllowTF32(false);
-    // Use TF32 setting if needed, but here we can just default or use env like
-    // matmul op. Since this is a static method, we don't have access to member
-    // tf32_enabled_. Let's check environment variable again or just assume
-    // default precision. For now, let's keep it simple and consistent with
-    // standard usage.
+    handle.SetAllowTF32(tf32_enabled_global);
 
     mTensor mt_a = CreateMTensor(in0);
     mTensor mt_b = CreateMTensor(in1);
