@@ -38,18 +38,63 @@ __global__ void DivNoNanKernel(const T* x, DivNoNanStrides x_st,
 }
 
 template <typename T>
+__global__ void DivNoNanContiguousKernel(const T* x, const T* y, T* out,
+                                         int n_total) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n_total) {
+    T val_y = y[i];
+    out[i] = (val_y == T(0)) ? T(0) : x[i] / val_y;
+  }
+}
+
+template <typename T>
+__global__ void DivNoNanYScalarKernel(const T* x, const T* y, T* out,
+                                      int n_total) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n_total) {
+    T val_y = y[0];
+    out[i] = (val_y == T(0)) ? T(0) : x[i] / val_y;
+  }
+}
+
+template <typename T>
+__global__ void DivNoNanXScalarKernel(const T* x, const T* y, T* out,
+                                      int n_total) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n_total) {
+    T val_y = y[i];
+    out[i] = (val_y == T(0)) ? T(0) : x[0] / val_y;
+  }
+}
+
+template <typename T>
 void LaunchDivNoNan(const T* in0, const T* in1, T* out,
                     DivNoNanStrides s_in0, DivNoNanStrides s_in1, DivNoNanDims dims,
-                    int total_elements, musaStream_t stream) {
+                    int total_elements, int fast_path, musaStream_t stream) {
   if (total_elements == 0) return;
   int block_size = 256;
   int grid_size = (total_elements + block_size - 1) / block_size;
+  if (fast_path == 1) {
+    DivNoNanContiguousKernel<T><<<grid_size, block_size, 0, stream>>>(
+        in0, in1, out, total_elements);
+    return;
+  }
+  if (fast_path == 2) {
+    DivNoNanYScalarKernel<T><<<grid_size, block_size, 0, stream>>>(
+        in0, in1, out, total_elements);
+    return;
+  }
+  if (fast_path == 3) {
+    DivNoNanXScalarKernel<T><<<grid_size, block_size, 0, stream>>>(
+        in0, in1, out, total_elements);
+    return;
+  }
   DivNoNanKernel<T><<<grid_size, block_size, 0, stream>>>(
       in0, s_in0, in1, s_in1, out, dims, total_elements);
 }
 
-template void LaunchDivNoNan<float>(const float*, const float*, float*, DivNoNanStrides, DivNoNanStrides, DivNoNanDims, int, musaStream_t);
-template void LaunchDivNoNan<double>(const double*, const double*, double*, DivNoNanStrides, DivNoNanStrides, DivNoNanDims, int, musaStream_t);
+template void LaunchDivNoNan<float>(const float*, const float*, float*, DivNoNanStrides, DivNoNanStrides, DivNoNanDims, int, int, musaStream_t);
+template void LaunchDivNoNan<double>(const double*, const double*, double*, DivNoNanStrides, DivNoNanStrides, DivNoNanDims, int, int, musaStream_t);
 
 } // namespace musa
 } // namespace tensorflow

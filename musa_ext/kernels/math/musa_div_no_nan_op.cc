@@ -7,6 +7,8 @@
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/util/bcast.h"
 
+#include "../utils_op.h"
+
 namespace tensorflow {
 namespace musa {
 
@@ -20,7 +22,7 @@ struct DivNoNanDims {
 template <typename T>
 void LaunchDivNoNan(const T* in0, const T* in1, T* out, DivNoNanStrides s_in0,
                     DivNoNanStrides s_in1, DivNoNanDims dims,
-                    int total_elements, musaStream_t stream);
+                    int total_elements, int fast_path, musaStream_t stream);
 
 template <typename T>
 class MusaDivNoNanOp : public OpKernel {
@@ -46,7 +48,17 @@ class MusaDivNoNanOp : public OpKernel {
 
     if (output->NumElements() == 0) return;
 
-    musaStream_t stream = 0;
+    auto& handle = GetHandleByCtx(ctx);
+    musaStream_t stream = reinterpret_cast<musaStream_t>(handle.GetStream());
+
+    int fast_path = 0;
+    if (input_0.shape() == output_shape && input_1.shape() == output_shape) {
+      fast_path = 1;
+    } else if (input_0.shape() == output_shape && input_1.NumElements() == 1) {
+      fast_path = 2;
+    } else if (input_0.NumElements() == 1 && input_1.shape() == output_shape) {
+      fast_path = 3;
+    }
 
     auto pad_shape_to_4d = [](const TensorShape& s) -> TensorShape {
       TensorShape new_s = s;
@@ -89,7 +101,7 @@ class MusaDivNoNanOp : public OpKernel {
 
     LaunchDivNoNan<T>(input_0.flat<T>().data(), input_1.flat<T>().data(),
                       output->flat<T>().data(), k_in0_st, k_in1_st, k_dims,
-                      output->NumElements(), stream);
+                      output->NumElements(), fast_path, stream);
   }
 };
 
