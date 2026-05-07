@@ -46,6 +46,7 @@ env:
   GPU_GUARD_PATTERN: '[r]un_inference.py|[m]usa_run_pb_graph.py|[r]un_all_training_tests.py|[t]est_tf_musa_extension.py|[t]est_runner.py'
   GPU_GUARD_TIMEOUT_SECONDS: 180
   GPU_LOCK_FILE: /tmp/tensorflow_musa_ci_gpu.lock
+  EMPTY_TEST_RESULT_PATTERN: 'No tests found|No test files found|Total Tests:[[:space:]]*0|Total Tests[[:space:]]*│[[:space:]]*0|总计:[[:space:]]*0|no average_time_summary entries|report path missing|log not found'
 
 jobs:
   prepare_metadata:
@@ -367,7 +368,7 @@ jobs:
   integration:
     name: Integration Test
     needs: [prepare_metadata, build_current]
-    if: needs.build_current.result == 'success'
+    if: needs.prepare_metadata.result == 'success' && needs.build_current.result == 'success'
     runs-on: [self-hosted, musa-gpu]
     timeout-minutes: 45
     outputs:
@@ -398,7 +399,7 @@ jobs:
           test_exit=0
           export LOG_FILE WHEEL_DIR="$RUNNER_TEMP/current-wheel"
           bash -l -c '
-            set -o pipefail
+            set -e -o pipefail
             cd "$GITHUB_WORKSPACE"
             pip install "$WHEEL_DIR"/tensorflow_musa-*.whl --no-deps --force-reinstall 2>&1 | tee "$LOG_FILE"
             cd "$GITHUB_WORKSPACE/test"
@@ -419,6 +420,11 @@ jobs:
           STATUS="success"
 
           if [[ "${{ steps.run_test.outputs.test_exit }}" != "0" ]]; then
+            STATUS="failure"
+          fi
+          if [[ ! -f "$LOG_FILE" ]]; then
+            STATUS="failure"
+          elif grep -Eq "$EMPTY_TEST_RESULT_PATTERN" "$LOG_FILE"; then
             STATUS="failure"
           fi
 
