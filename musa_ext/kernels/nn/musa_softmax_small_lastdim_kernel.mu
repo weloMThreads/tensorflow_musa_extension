@@ -50,10 +50,10 @@ __global__ void SmallLastDimSoftmaxFloatKernel(const float* input,
   float e0 = 0.0f;
   float e1 = 0.0f;
   if (idx0 < last_dim) {
-    e0 = expf(x0 - row_max);
+    e0 = __expf(x0 - row_max);
   }
   if (idx1 < last_dim) {
-    e1 = expf(x1 - row_max);
+    e1 = __expf(x1 - row_max);
   }
 
   const float row_sum = WarpReduceSum(e0 + e1);
@@ -85,7 +85,7 @@ __global__ void SmallLastDimSoftmaxFloatLe32Kernel(const float* input,
 
   float e = 0.0f;
   if (lane < last_dim) {
-    e = expf(x - row_max);
+    e = __expf(x - row_max);
   }
 
   const float row_sum = WarpReduceSum(e);
@@ -97,14 +97,15 @@ __global__ void SmallLastDimSoftmaxFloatLe32Kernel(const float* input,
 }
 
 __global__ void SmallLastDimCausalMaskedSoftmaxFloatKernel(
-    const float* input, float* output, int64_t outer_size, int query_dim,
-    int key_dim) {
+    const float* input, const float* scale_ptr, float* output,
+    int64_t outer_size, int query_dim, int key_dim) {
   const int lane = threadIdx.x;
   const int row_in_block = threadIdx.y;
   const int query_idx = static_cast<int>(blockIdx.x) * blockDim.y + row_in_block;
   const int64_t row = static_cast<int64_t>(blockIdx.y) * query_dim + query_idx;
   if (query_idx >= query_dim || row >= outer_size) return;
 
+  const float scale = *scale_ptr;
   const int last_unmasked_key = key_dim - query_dim + query_idx;
   const float* row_in = input + row * key_dim;
   float* row_out = output + row * key_dim;
@@ -114,15 +115,15 @@ __global__ void SmallLastDimCausalMaskedSoftmaxFloatKernel(
 
   const bool valid0 = idx0 < key_dim && idx0 <= last_unmasked_key;
   const bool valid1 = idx1 < key_dim && idx1 <= last_unmasked_key;
-  const float x0 = valid0 ? row_in[idx0] : kNegInf;
-  const float x1 = valid1 ? row_in[idx1] : kNegInf;
+  const float x0 = valid0 ? row_in[idx0] * scale : kNegInf;
+  const float x1 = valid1 ? row_in[idx1] * scale : kNegInf;
 
   const float row_max = WarpReduceMax(fmaxf(x0, x1));
 
   float e0 = 0.0f;
   float e1 = 0.0f;
-  if (valid0) e0 = expf(x0 - row_max);
-  if (valid1) e1 = expf(x1 - row_max);
+  if (valid0) e0 = __expf(x0 - row_max);
+  if (valid1) e1 = __expf(x1 - row_max);
 
   const float row_sum = WarpReduceSum(e0 + e1);
   const float inv_sum = 1.0f / row_sum;
@@ -132,24 +133,25 @@ __global__ void SmallLastDimCausalMaskedSoftmaxFloatKernel(
 }
 
 __global__ void SmallLastDimCausalMaskedSoftmaxFloatLe32Kernel(
-    const float* input, float* output, int64_t outer_size, int query_dim,
-    int key_dim) {
+    const float* input, const float* scale_ptr, float* output,
+    int64_t outer_size, int query_dim, int key_dim) {
   const int lane = threadIdx.x;
   const int row_in_block = threadIdx.y;
   const int query_idx = static_cast<int>(blockIdx.x) * blockDim.y + row_in_block;
   const int64_t row = static_cast<int64_t>(blockIdx.y) * query_dim + query_idx;
   if (query_idx >= query_dim || row >= outer_size) return;
 
+  const float scale = *scale_ptr;
   const int last_unmasked_key = key_dim - query_dim + query_idx;
   const float* row_in = input + row * key_dim;
   float* row_out = output + row * key_dim;
 
   const bool valid = lane < key_dim && lane <= last_unmasked_key;
-  const float x = valid ? row_in[lane] : kNegInf;
+  const float x = valid ? row_in[lane] * scale : kNegInf;
   const float row_max = WarpReduceMax(x);
 
   float e = 0.0f;
-  if (valid) e = expf(x - row_max);
+  if (valid) e = __expf(x - row_max);
 
   const float row_sum = WarpReduceSum(e);
   const float inv_sum = 1.0f / row_sum;
@@ -181,8 +183,8 @@ extern "C" void LaunchMusaSmallLastDimSoftmaxFloat(const float* input,
 }
 
 extern "C" void LaunchMusaSmallLastDimCausalMaskedSoftmaxFloat(
-    const float* input, float* output, int64_t outer_size, int query_dim,
-    int key_dim, musaStream_t stream) {
+    const float* input, const float* scale, float* output, int64_t outer_size,
+    int query_dim, int key_dim, musaStream_t stream) {
   if (outer_size <= 0 || query_dim <= 0 || key_dim <= 0 ||
       query_dim > key_dim || key_dim > 64) {
     return;
@@ -195,14 +197,14 @@ extern "C" void LaunchMusaSmallLastDimCausalMaskedSoftmaxFloat(
                         kRowsPerBlockLe32,
                     outer_groups, 1);
     SmallLastDimCausalMaskedSoftmaxFloatLe32Kernel<<<grid, block, 0, stream>>>(
-        input, output, outer_size, query_dim, key_dim);
+        input, scale, output, outer_size, query_dim, key_dim);
   } else {
     const dim3 block(kWarpSize, kRowsPerBlock, 1);
     const int64_t outer_groups = outer_size / query_dim;
     const dim3 grid((query_dim + kRowsPerBlock - 1) / kRowsPerBlock,
                     outer_groups, 1);
     SmallLastDimCausalMaskedSoftmaxFloatKernel<<<grid, block, 0, stream>>>(
-        input, output, outer_size, query_dim, key_dim);
+        input, scale, output, outer_size, query_dim, key_dim);
   }
 }
 

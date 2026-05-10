@@ -1322,17 +1322,33 @@ int OptimizeCausalMaskedSoftmax(GraphDef* graph) {
     return it == node_map.end() ? nullptr : it->second;
   };
 
-  auto is_matmul_or_scaled_matmul = [&](const NodeDef* node) -> bool {
-    if (node == nullptr) return false;
-    if (node->op() == "BatchMatMulV2") return true;
-    if (node->op() != "Mul" || node->input_size() != 2 ||
+  struct ScaledMatMulInfo {
+    string logits_input;
+    string scale_input;
+    const NodeDef* scale_mul = nullptr;
+  };
+
+  auto get_scaled_matmul = [&](const NodeDef* node,
+                               ScaledMatMulInfo* info) -> bool {
+    if (node == nullptr || node->op() != "Mul" || node->input_size() != 2 ||
         !HasFloatTypeAttr(*node)) {
       return false;
     }
     const NodeDef* lhs = find_node(node->input(0));
     const NodeDef* rhs = find_node(node->input(1));
-    return (lhs != nullptr && lhs->op() == "BatchMatMulV2") ||
-           (rhs != nullptr && rhs->op() == "BatchMatMulV2");
+    if (lhs != nullptr && lhs->op() == "BatchMatMulV2") {
+      info->logits_input = node->input(0);
+      info->scale_input = node->input(1);
+      info->scale_mul = node;
+      return true;
+    }
+    if (rhs != nullptr && rhs->op() == "BatchMatMulV2") {
+      info->logits_input = node->input(1);
+      info->scale_input = node->input(0);
+      info->scale_mul = node;
+      return true;
+    }
+    return false;
   };
 
   auto is_mask_side = [&](const NodeDef* node) -> bool {
@@ -1374,24 +1390,27 @@ int OptimizeCausalMaskedSoftmax(GraphDef* graph) {
     const NodeDef* rhs = find_node(add->input(1));
     if (lhs == nullptr || rhs == nullptr) continue;
 
-    string logits_input;
+    ScaledMatMulInfo scaled;
     const NodeDef* mask_node = nullptr;
-    if (is_matmul_or_scaled_matmul(lhs) && is_mask_side(rhs)) {
-      logits_input = add->input(0);
+    if (get_scaled_matmul(lhs, &scaled) && is_mask_side(rhs)) {
       mask_node = rhs;
-    } else if (is_matmul_or_scaled_matmul(rhs) && is_mask_side(lhs)) {
-      logits_input = add->input(1);
+    } else if (get_scaled_matmul(rhs, &scaled) && is_mask_side(lhs)) {
       mask_node = lhs;
     } else {
+      continue;
+    }
+    if (!IsOnlyConsumer(consumers, scaled.scale_mul->name(), add->name())) {
       continue;
     }
 
     softmax->set_op("MusaCausalMaskedSoftmax");
     softmax->clear_input();
-    softmax->add_input(logits_input);
+    softmax->add_input(scaled.logits_input);
+    softmax->add_input(scaled.scale_input);
     softmax->mutable_attr()->clear();
 
     remove_names.insert(add->name());
+    remove_names.insert(scaled.scale_mul->name());
     if (mask_node != nullptr &&
         IsOnlyConsumer(consumers, mask_node->name(), add->name())) {
       remove_names.insert(mask_node->name());
@@ -1520,6 +1539,190 @@ int OptimizeSoftmaxGradSmallLastDim(GraphDef* graph) {
   return rewrites;
 }
 
+
+bool IsBoolToFloatCast(const NodeDef* node) {
+  if (node == nullptr || node->op() != "Cast" || node->input_size() != 1) {
+    return false;
+  }
+  const auto src_it = node->attr().find("SrcT");
+  const auto dst_it = node->attr().find("DstT");
+  return src_it != node->attr().end() && dst_it != node->attr().end() &&
+         src_it->second.type() == DT_BOOL && dst_it->second.type() == DT_FLOAT;
+}
+
+bool TryGetMulConstScale(const NodeDef* mul,
+                         const std::unordered_map<string, const NodeDef*>&
+                             node_map,
+                         string* data_input, float* scale) {
+  if (mul == nullptr || mul->op() != "Mul" || mul->input_size() != 2 ||
+      !HasFloatTypeAttr(*mul)) {
+    return false;
+  }
+
+  auto find_node = [&](const string& input) -> const NodeDef* {
+    const auto it = node_map.find(NodeNameFromInputLocal(input));
+    return it == node_map.end() ? nullptr : it->second;
+  };
+
+  const NodeDef* lhs = find_node(mul->input(0));
+  const NodeDef* rhs = find_node(mul->input(1));
+  float lhs_scale = 0.0f;
+  float rhs_scale = 0.0f;
+  if (GetConstScalarFloat(lhs, &lhs_scale)) {
+    *data_input = mul->input(1);
+    *scale = lhs_scale;
+    return true;
+  }
+  if (GetConstScalarFloat(rhs, &rhs_scale)) {
+    *data_input = mul->input(0);
+    *scale = rhs_scale;
+    return true;
+  }
+  return false;
+}
+
+int OptimizeDropoutScaledMaskMul(GraphDef* graph) {
+  std::unordered_map<string, const NodeDef*> node_map;
+  node_map.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    node_map[node.name()] = &node;
+  }
+
+  std::unordered_map<string, std::vector<string>> consumers;
+  consumers.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    for (const auto& input : node.input()) {
+      if (!input.empty() && input[0] != '^') {
+        consumers[NodeNameFromInputLocal(input)].push_back(node.name());
+      }
+    }
+  }
+
+  auto find_node = [&](const string& input) -> const NodeDef* {
+    const auto it = node_map.find(NodeNameFromInputLocal(input));
+    return it == node_map.end() ? nullptr : it->second;
+  };
+
+  auto create_fused = [&](const NodeDef& old_node, const string& data_input,
+                          const NodeDef* cast, float scale,
+                          std::unordered_set<string>* remove_names) -> bool {
+    if (cast == nullptr) return false;
+    const string fused_name = old_node.name() + "/musa_scaled_masked_mul";
+    if (node_map.find(fused_name) != node_map.end()) return false;
+
+    NodeDef* fused = graph->add_node();
+    fused->set_name(fused_name);
+    fused->set_op("MusaScaledMaskedMul");
+    fused->set_device(old_node.device());
+    fused->add_input(data_input);
+    fused->add_input(cast->input(0));
+    (*fused->mutable_attr())["T"].set_type(DT_FLOAT);
+    (*fused->mutable_attr())["scale"].set_f(scale);
+
+    RedirectNodeOutputs(graph, old_node.name(), fused_name);
+    remove_names->insert(old_node.name());
+    return true;
+  };
+
+  std::unordered_set<string> remove_names;
+  int rewrites = 0;
+  const int original_node_size = graph->node_size();
+  for (int i = 0; i < original_node_size; ++i) {
+    const NodeDef& final_mul = graph->node(i);
+    if (final_mul.op() != "Mul" || final_mul.input_size() != 2 ||
+        !HasFloatTypeAttr(final_mul) ||
+        final_mul.name().find("/dropout") == string::npos) {
+      continue;
+    }
+
+    const NodeDef* in0 = find_node(final_mul.input(0));
+    const NodeDef* in1 = find_node(final_mul.input(1));
+    if (in0 == nullptr || in1 == nullptr) continue;
+
+    const NodeDef* cast = nullptr;
+    const NodeDef* scaled_mul = nullptr;
+    if (IsBoolToFloatCast(in0) && in1->op() == "Mul") {
+      cast = in0;
+      scaled_mul = in1;
+    } else if (IsBoolToFloatCast(in1) && in0->op() == "Mul") {
+      cast = in1;
+      scaled_mul = in0;
+    }
+
+    string data_input;
+    float scale = 0.0f;
+    if (cast != nullptr &&
+        TryGetMulConstScale(scaled_mul, node_map, &data_input, &scale)) {
+      if (create_fused(final_mul, data_input, cast, scale, &remove_names)) {
+        const auto scaled_consumer_it = consumers.find(scaled_mul->name());
+        if (scaled_consumer_it == consumers.end() ||
+            (scaled_consumer_it->second.size() == 1 &&
+             scaled_consumer_it->second[0] == final_mul.name())) {
+          remove_names.insert(scaled_mul->name());
+        }
+        rewrites++;
+      }
+      continue;
+    }
+
+    const NodeDef* scale_mul = nullptr;
+    float final_scale = 0.0f;
+    string mask_mul_input;
+    if (GetConstScalarFloat(in0, &final_scale) && in1->op() == "Mul") {
+      scale_mul = in1;
+    } else if (GetConstScalarFloat(in1, &final_scale) && in0->op() == "Mul") {
+      scale_mul = in0;
+    }
+    if (scale_mul == nullptr || scale_mul->input_size() != 2 ||
+        !HasFloatTypeAttr(*scale_mul) ||
+        !IsOnlyConsumer(consumers, scale_mul->name(), final_mul.name())) {
+      continue;
+    }
+
+    const NodeDef* scale_in0 = find_node(scale_mul->input(0));
+    const NodeDef* scale_in1 = find_node(scale_mul->input(1));
+    const NodeDef* mask_cast = nullptr;
+    if (IsBoolToFloatCast(scale_in0)) {
+      mask_cast = scale_in0;
+      mask_mul_input = scale_mul->input(1);
+    } else if (IsBoolToFloatCast(scale_in1)) {
+      mask_cast = scale_in1;
+      mask_mul_input = scale_mul->input(0);
+    }
+    if (mask_cast == nullptr) continue;
+
+    if (create_fused(final_mul, mask_mul_input, mask_cast, final_scale,
+                     &remove_names)) {
+      remove_names.insert(scale_mul->name());
+      rewrites++;
+    }
+  }
+
+  for (const auto& node : graph->node()) {
+    if (!IsBoolToFloatCast(&node)) continue;
+    const auto consumer_it = consumers.find(node.name());
+    if (consumer_it == consumers.end() || consumer_it->second.empty()) {
+      continue;
+    }
+    bool all_consumers_removed = true;
+    for (const string& consumer : consumer_it->second) {
+      if (remove_names.find(consumer) == remove_names.end()) {
+        all_consumers_removed = false;
+        break;
+      }
+    }
+    if (all_consumers_removed) {
+      remove_names.insert(node.name());
+    }
+  }
+
+  RemoveNodesByName(graph, remove_names);
+  if (rewrites > 0) {
+    LOG(INFO) << "MusaGraphOptimizer: Rewrote " << rewrites
+              << " dropout scaled-mask Mul node(s)";
+  }
+  return rewrites;
+}
 
 int OptimizeSliceGradAddNConcat(GraphDef* graph) {
   std::unordered_map<string, const NodeDef*> node_map;
@@ -1963,6 +2166,13 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
     if (gelu_grad_rewrites > 0) {
       dumper.DumpAtStage(*optimized_graph,
                          "after_exact_gelu_grad_fusion");
+    }
+
+    const int dropout_scaled_mask_rewrites =
+        OptimizeDropoutScaledMaskMul(optimized_graph);
+    if (dropout_scaled_mask_rewrites > 0) {
+      dumper.DumpAtStage(*optimized_graph,
+                         "after_dropout_scaled_mask_fusion");
     }
 
     const int causal_mask_softmax_rewrites =
