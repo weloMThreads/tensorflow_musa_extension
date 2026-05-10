@@ -1299,6 +1299,114 @@ bool IsReductionIndexMinusOne(const NodeDef* node) {
          values[0] == -1;
 }
 
+
+int OptimizeCausalMaskedSoftmax(GraphDef* graph) {
+  std::unordered_map<string, const NodeDef*> node_map;
+  node_map.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    node_map[node.name()] = &node;
+  }
+
+  std::unordered_map<string, std::vector<string>> consumers;
+  consumers.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    for (const auto& input : node.input()) {
+      if (!input.empty() && input[0] != '^') {
+        consumers[NodeNameFromInputLocal(input)].push_back(node.name());
+      }
+    }
+  }
+
+  auto find_node = [&](const string& input) -> const NodeDef* {
+    const auto it = node_map.find(NodeNameFromInputLocal(input));
+    return it == node_map.end() ? nullptr : it->second;
+  };
+
+  auto is_matmul_or_scaled_matmul = [&](const NodeDef* node) -> bool {
+    if (node == nullptr) return false;
+    if (node->op() == "BatchMatMulV2") return true;
+    if (node->op() != "Mul" || node->input_size() != 2 ||
+        !HasFloatTypeAttr(*node)) {
+      return false;
+    }
+    const NodeDef* lhs = find_node(node->input(0));
+    const NodeDef* rhs = find_node(node->input(1));
+    return (lhs != nullptr && lhs->op() == "BatchMatMulV2") ||
+           (rhs != nullptr && rhs->op() == "BatchMatMulV2");
+  };
+
+  auto is_mask_side = [&](const NodeDef* node) -> bool {
+    if (node == nullptr) return false;
+    if (node->op() == "Const") return true;
+    // Original playground builds the causal mask dynamically as
+    // Mul(StridedSlice(Cast(Greater(...))), negative_large_const).
+    if (node->op() != "Mul" || node->input_size() != 2 ||
+        !HasFloatTypeAttr(*node)) {
+      return false;
+    }
+    const NodeDef* lhs = find_node(node->input(0));
+    const NodeDef* rhs = find_node(node->input(1));
+    return (lhs != nullptr && (lhs->op() == "StridedSlice" ||
+                              lhs->op() == "Cast" || lhs->op() == "Const")) ||
+           (rhs != nullptr && (rhs->op() == "StridedSlice" ||
+                              rhs->op() == "Cast" || rhs->op() == "Const"));
+  };
+
+  std::unordered_set<string> remove_names;
+  int rewrites = 0;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    NodeDef* softmax = graph->mutable_node(i);
+    if (softmax->op() != "Softmax" || softmax->input_size() != 1 ||
+        softmax->name().find("pyramid_mixed_causal_attention") ==
+            string::npos) {
+      continue;
+    }
+
+    const NodeDef* add = find_node(softmax->input(0));
+    if (add == nullptr || add->input_size() != 2 ||
+        (add->op() != "AddV2" && add->op() != "Add") ||
+        !HasFloatTypeAttr(*add) ||
+        !IsOnlyConsumer(consumers, add->name(), softmax->name())) {
+      continue;
+    }
+
+    const NodeDef* lhs = find_node(add->input(0));
+    const NodeDef* rhs = find_node(add->input(1));
+    if (lhs == nullptr || rhs == nullptr) continue;
+
+    string logits_input;
+    const NodeDef* mask_node = nullptr;
+    if (is_matmul_or_scaled_matmul(lhs) && is_mask_side(rhs)) {
+      logits_input = add->input(0);
+      mask_node = rhs;
+    } else if (is_matmul_or_scaled_matmul(rhs) && is_mask_side(lhs)) {
+      logits_input = add->input(1);
+      mask_node = lhs;
+    } else {
+      continue;
+    }
+
+    softmax->set_op("MusaCausalMaskedSoftmax");
+    softmax->clear_input();
+    softmax->add_input(logits_input);
+    softmax->mutable_attr()->clear();
+
+    remove_names.insert(add->name());
+    if (mask_node != nullptr &&
+        IsOnlyConsumer(consumers, mask_node->name(), add->name())) {
+      remove_names.insert(mask_node->name());
+    }
+    rewrites++;
+  }
+
+  RemoveNodesByName(graph, remove_names);
+  if (rewrites > 0) {
+    LOG(INFO) << "MusaGraphOptimizer: Rewrote " << rewrites
+              << " causal mask Softmax node(s)";
+  }
+  return rewrites;
+}
+
 int OptimizeSoftmaxGradSmallLastDim(GraphDef* graph) {
   std::unordered_map<string, const NodeDef*> node_map;
   node_map.reserve(graph->node_size());
@@ -1340,7 +1448,8 @@ int OptimizeSoftmaxGradSmallLastDim(GraphDef* graph) {
       if (candidate == nullptr) continue;
       if (candidate->op() == "Sub") {
         sub = candidate;
-      } else if (candidate->op() == "Softmax") {
+      } else if (candidate->op() == "Softmax" ||
+                 candidate->op() == "MusaCausalMaskedSoftmax") {
         softmax = candidate;
       }
     }
@@ -1854,6 +1963,13 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
     if (gelu_grad_rewrites > 0) {
       dumper.DumpAtStage(*optimized_graph,
                          "after_exact_gelu_grad_fusion");
+    }
+
+    const int causal_mask_softmax_rewrites =
+        OptimizeCausalMaskedSoftmax(optimized_graph);
+    if (causal_mask_softmax_rewrites > 0) {
+      dumper.DumpAtStage(*optimized_graph,
+                         "after_causal_mask_softmax_fusion");
     }
 
     const int softmax_grad_rewrites =
