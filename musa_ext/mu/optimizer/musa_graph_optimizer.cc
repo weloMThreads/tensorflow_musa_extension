@@ -17,16 +17,21 @@ limitations under the License.
 #include <cctype>
 #include <cstdlib>
 #include <map>
+#include <cstring>
+#include <memory>
 #include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "graph/fusion/fusion_pattern_manager.h"
 #include "graph/fusion/gelu_fusion.h"
 #include "graph/fusion/layernorm_fusion.h"
 #include "mu/optimizer/graph_utils.h"
+#include "tensorflow/core/common_runtime/graph_constructor.h"
+#include "tensorflow/core/common_runtime/optimization_registry.h"
 #include "tensorflow/core/framework/attr_value.pb.h"
 #include "tensorflow/core/framework/graph.pb.h"
 #include "tensorflow/core/framework/node_def.pb.h"
@@ -38,6 +43,7 @@ limitations under the License.
 #include "tensorflow/core/grappler/optimizers/custom_graph_optimizer.h"
 #include "tensorflow/core/grappler/optimizers/custom_graph_optimizer_registry.h"
 #include "tensorflow/core/grappler/utils.h"
+#include "tensorflow/core/graph/graph.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/platform/logging.h"
 
@@ -71,6 +77,15 @@ std::string NormalizeFusionPatternName(const std::string& value) {
       normalized.begin(), normalized.end(), normalized.begin(),
       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
   return normalized;
+}
+
+bool EnvFlagEnabledLocal(const char* env_name) {
+  const char* env_val = std::getenv(env_name);
+  if (env_val == nullptr) return false;
+  const std::string value(env_val);
+  return value == "1" || value == "true" || value == "TRUE" ||
+         value == "yes" || value == "YES" || value == "on" ||
+         value == "ON";
 }
 
 // Tri-state configuration for optimizers
@@ -272,7 +287,7 @@ bool GraphHasMusaNodes(const GraphDef& graph) {
       return true;
     }
   }
-  return false;
+  return graph.node_size() > 0;
 }
 
 bool IsFusionResidualConst(const NodeDef& node) {
@@ -326,6 +341,1370 @@ int RemoveIsolatedNodes(GraphDef* graph) {
       removed_count++;
     }
   }
+}
+
+string NodeNameFromInputLocal(const string& input) {
+  if (input.empty()) return "";
+  const string data_input = input[0] == '^' ? input.substr(1) : input;
+  const size_t colon_pos = data_input.find(':');
+  if (colon_pos == std::string::npos) return data_input;
+  return data_input.substr(0, colon_pos);
+}
+
+bool GetConstIntVector(const NodeDef* node, std::vector<int64_t>* values) {
+  if (node == nullptr || node->op() != "Const") return false;
+  const auto& attr = node->attr();
+  const auto dtype_it = attr.find("dtype");
+  const auto value_it = attr.find("value");
+  if (dtype_it == attr.end() || value_it == attr.end()) return false;
+
+  const DataType dtype = dtype_it->second.type();
+  if (dtype != DT_INT32 && dtype != DT_INT64) return false;
+
+  const TensorProto& tensor = value_it->second.tensor();
+  int64_t element_count = 1;
+  if (tensor.tensor_shape().unknown_rank()) return false;
+  for (const auto& dim : tensor.tensor_shape().dim()) {
+    if (dim.size() < 0) return false;
+    element_count *= dim.size();
+  }
+
+  values->clear();
+  if (!tensor.tensor_content().empty()) {
+    const string& content = tensor.tensor_content();
+    const size_t elem_size = dtype == DT_INT32 ? sizeof(int32) : sizeof(int64_t);
+    if (content.size() % elem_size != 0) return false;
+    const size_t count = content.size() / elem_size;
+    values->reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+      if (dtype == DT_INT32) {
+        int32 value;
+        std::memcpy(&value, content.data() + i * elem_size, elem_size);
+        values->push_back(value);
+      } else {
+        int64_t value;
+        std::memcpy(&value, content.data() + i * elem_size, elem_size);
+        values->push_back(value);
+      }
+    }
+    return element_count == 0 || static_cast<int64_t>(values->size()) == element_count;
+  }
+
+  if (dtype == DT_INT32) {
+    if (tensor.int_val_size() == 0) return element_count == 0;
+    if (tensor.int_val_size() == 1 && element_count > 1) {
+      values->assign(element_count, tensor.int_val(0));
+    } else {
+      values->reserve(tensor.int_val_size());
+      for (int i = 0; i < tensor.int_val_size(); ++i) {
+        values->push_back(tensor.int_val(i));
+      }
+    }
+  } else {
+    if (tensor.int64_val_size() == 0) return element_count == 0;
+    if (tensor.int64_val_size() == 1 && element_count > 1) {
+      values->assign(element_count, tensor.int64_val(0));
+    } else {
+      values->reserve(tensor.int64_val_size());
+      for (int i = 0; i < tensor.int64_val_size(); ++i) {
+        values->push_back(tensor.int64_val(i));
+      }
+    }
+  }
+
+  return element_count == 0 || static_cast<int64_t>(values->size()) == element_count;
+}
+
+struct SliceGradSegment {
+  const NodeDef* node = nullptr;
+  string dy_input;
+  std::vector<int64_t> output_shape;
+  int64_t start = -1;
+  int64_t end = -1;
+};
+
+struct DynamicSliceGradSegment {
+  const NodeDef* node = nullptr;
+  string dy_input;
+  std::vector<int64_t> output_shape;
+  string split_input;
+  bool is_prefix = false;
+};
+
+bool TryParseConstAxis1SliceGrad(
+    const NodeDef& node,
+    const std::unordered_map<string, const NodeDef*>& node_map,
+    SliceGradSegment* segment) {
+  if (node.op() != "StridedSliceGrad" || node.input_size() < 5) return false;
+  const auto t_it = node.attr().find("T");
+  if (t_it == node.attr().end() || t_it->second.type() != DT_FLOAT) {
+    return false;
+  }
+
+  auto get_input_node = [&](int idx) -> const NodeDef* {
+    const auto it = node_map.find(NodeNameFromInputLocal(node.input(idx)));
+    return it == node_map.end() ? nullptr : it->second;
+  };
+
+  std::vector<int64_t> shape;
+  std::vector<int64_t> begin;
+  std::vector<int64_t> end;
+  std::vector<int64_t> strides;
+  if (!GetConstIntVector(get_input_node(0), &shape) ||
+      !GetConstIntVector(get_input_node(1), &begin) ||
+      !GetConstIntVector(get_input_node(2), &end) ||
+      !GetConstIntVector(get_input_node(3), &strides)) {
+    return false;
+  }
+
+  if (shape.size() < 2 || begin.size() < 2 || end.size() < 2 ||
+      strides.size() < 2) {
+    return false;
+  }
+  if (shape[1] <= 0 || begin[0] != 0 || end[0] != 0 ||
+      strides[0] != 1 || strides[1] != 1) {
+    return false;
+  }
+
+  const int64_t axis_dim = shape[1];
+  int64_t start = -1;
+  int64_t finish = -1;
+  if (begin[1] == 0 && end[1] > 0 && end[1] < axis_dim) {
+    start = 0;
+    finish = end[1];
+  } else if (begin[1] > 0 && begin[1] < axis_dim &&
+             (end[1] == 0 || end[1] == axis_dim)) {
+    start = begin[1];
+    finish = axis_dim;
+  } else {
+    return false;
+  }
+
+  segment->node = &node;
+  segment->dy_input = node.input(4);
+  segment->output_shape = std::move(shape);
+  segment->start = start;
+  segment->end = finish;
+  return true;
+}
+
+bool IsConstAxis1ZeroVector(const NodeDef* node) {
+  std::vector<int64_t> values;
+  return GetConstIntVector(node, &values) && values.size() >= 2 &&
+         values[0] == 0 && values[1] == 0;
+}
+
+bool TryGetPackAxis1Boundary(
+    const NodeDef* node,
+    const std::unordered_map<string, const NodeDef*>& node_map,
+    string* split_input) {
+  if (node == nullptr || node->op() != "Pack" || node->input_size() != 2) {
+    return false;
+  }
+
+  const auto first_it = node_map.find(NodeNameFromInputLocal(node->input(0)));
+  if (first_it == node_map.end()) return false;
+  std::vector<int64_t> first_values;
+  if (!GetConstIntVector(first_it->second, &first_values) ||
+      first_values.empty() || first_values[0] != 0) {
+    return false;
+  }
+
+  *split_input = NodeNameFromInputLocal(node->input(1));
+  return !split_input->empty();
+}
+
+bool TryParseDynamicAxis1SliceGrad(
+    const NodeDef& node,
+    const std::unordered_map<string, const NodeDef*>& node_map,
+    DynamicSliceGradSegment* segment) {
+  if (node.op() != "StridedSliceGrad" || node.input_size() < 5) return false;
+  const auto t_it = node.attr().find("T");
+  if (t_it == node.attr().end() || t_it->second.type() != DT_FLOAT) {
+    return false;
+  }
+
+  auto get_input_node = [&](int idx) -> const NodeDef* {
+    const auto it = node_map.find(NodeNameFromInputLocal(node.input(idx)));
+    return it == node_map.end() ? nullptr : it->second;
+  };
+
+  std::vector<int64_t> shape;
+  std::vector<int64_t> strides;
+  if (!GetConstIntVector(get_input_node(0), &shape) ||
+      !GetConstIntVector(get_input_node(3), &strides)) {
+    return false;
+  }
+  if (shape.size() < 2 || shape[1] <= 0 || strides.size() < 2 ||
+      strides[0] != 1 || strides[1] != 1) {
+    return false;
+  }
+
+  const NodeDef* begin_node = get_input_node(1);
+  const NodeDef* end_node = get_input_node(2);
+  string split_input;
+  bool is_prefix = false;
+  if (IsConstAxis1ZeroVector(begin_node) &&
+      TryGetPackAxis1Boundary(end_node, node_map, &split_input)) {
+    is_prefix = true;
+  } else if (TryGetPackAxis1Boundary(begin_node, node_map, &split_input) &&
+             IsConstAxis1ZeroVector(end_node)) {
+    is_prefix = false;
+  } else {
+    return false;
+  }
+
+  segment->node = &node;
+  segment->dy_input = node.input(4);
+  segment->output_shape = std::move(shape);
+  segment->split_input = std::move(split_input);
+  segment->is_prefix = is_prefix;
+  return true;
+}
+
+
+bool TryParseConstAxis1SuffixSliceGrad(
+    const NodeDef& node,
+    const std::unordered_map<string, const NodeDef*>& node_map,
+    SliceGradSegment* segment, int64_t* inner_dim) {
+  if (node.op() != "StridedSliceGrad" || node.input_size() < 5) return false;
+  const auto t_it = node.attr().find("T");
+  if (t_it == node.attr().end() || t_it->second.type() != DT_FLOAT) {
+    return false;
+  }
+
+  auto get_input_node = [&](int idx) -> const NodeDef* {
+    const auto it = node_map.find(NodeNameFromInputLocal(node.input(idx)));
+    return it == node_map.end() ? nullptr : it->second;
+  };
+
+  std::vector<int64_t> shape;
+  std::vector<int64_t> begin;
+  std::vector<int64_t> end;
+  std::vector<int64_t> strides;
+  if (!GetConstIntVector(get_input_node(0), &shape) ||
+      !GetConstIntVector(get_input_node(1), &begin) ||
+      !GetConstIntVector(get_input_node(2), &end) ||
+      !GetConstIntVector(get_input_node(3), &strides)) {
+    return false;
+  }
+  if (shape.size() < 2 || begin.size() < 2 || end.size() < 2 ||
+      strides.size() < 2 || shape[1] <= 0 || begin[0] != 0 ||
+      end[0] != 0 || strides[0] != 1 || strides[1] != 1) {
+    return false;
+  }
+
+  const int64_t axis_dim = shape[1];
+  const int64_t start = begin[1] < 0 ? axis_dim + begin[1] : begin[1];
+  if (start <= 0 || start >= axis_dim ||
+      !(end[1] == 0 || end[1] == axis_dim)) {
+    return false;
+  }
+
+  *inner_dim = 1;
+  for (size_t i = 2; i < shape.size(); ++i) {
+    *inner_dim *= shape[i];
+  }
+  segment->node = &node;
+  segment->dy_input = node.input(4);
+  segment->output_shape = std::move(shape);
+  segment->start = start;
+  segment->end = axis_dim;
+  return *inner_dim > 0;
+}
+
+bool IsConstLastAxis(const NodeDef* node) {
+  std::vector<int64_t> value;
+  if (!GetConstIntVector(node, &value) || value.size() != 1) {
+    return false;
+  }
+  return value[0] == -1 || value[0] == 2;
+}
+
+void RedirectNodeOutputs(GraphDef* graph, const string& old_node_name,
+                         const string& new_node_name) {
+  for (int i = 0; i < graph->node_size(); ++i) {
+    NodeDef* node = graph->mutable_node(i);
+    if (node->name() == new_node_name) continue;
+    for (int j = 0; j < node->input_size(); ++j) {
+      const string input = node->input(j);
+      if (input == old_node_name || input == old_node_name + ":0") {
+        node->set_input(j, new_node_name);
+      } else if (input == "^" + old_node_name) {
+        node->set_input(j, "^" + new_node_name);
+      }
+    }
+  }
+}
+
+void RemoveNodesByName(GraphDef* graph,
+                       const std::unordered_set<string>& remove_names) {
+  if (remove_names.empty()) return;
+  GraphDef kept;
+  *kept.mutable_versions() = graph->versions();
+  *kept.mutable_library() = graph->library();
+  for (const auto& node : graph->node()) {
+    if (remove_names.find(node.name()) != remove_names.end()) {
+      continue;
+    }
+    *kept.add_node() = node;
+  }
+  graph->Swap(&kept);
+}
+
+
+bool StringEndsWithLocal(const string& value, const string& suffix) {
+  return value.size() >= suffix.size() &&
+         value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+bool HasFloatTypeAttr(const NodeDef& node) {
+  const auto it = node.attr().find("T");
+  return it != node.attr().end() && it->second.type() == DT_FLOAT;
+}
+
+bool GetConstScalarFloat(const NodeDef* node, float* value) {
+  if (node == nullptr || node->op() != "Const") return false;
+  const auto dtype_it = node->attr().find("dtype");
+  const auto value_it = node->attr().find("value");
+  if (dtype_it == node->attr().end() || value_it == node->attr().end() ||
+      dtype_it->second.type() != DT_FLOAT) {
+    return false;
+  }
+  const TensorProto& tensor = value_it->second.tensor();
+  if (!tensor.tensor_content().empty()) {
+    if (tensor.tensor_content().size() < sizeof(float)) return false;
+    std::memcpy(value, tensor.tensor_content().data(), sizeof(float));
+    return true;
+  }
+  if (tensor.float_val_size() <= 0) return false;
+  *value = tensor.float_val(0);
+  return true;
+}
+
+bool IsOnlyConsumer(const std::unordered_map<string, std::vector<string>>& consumers,
+                    const string& producer, const string& consumer) {
+  const auto it = consumers.find(producer);
+  return it != consumers.end() && it->second.size() == 1 &&
+         it->second[0] == consumer;
+}
+
+void RedirectDataConsumersToInput(GraphDef* graph, const string& old_node_name,
+                                  const string& new_input,
+                                  const string& skip_node_name) {
+  for (int i = 0; i < graph->node_size(); ++i) {
+    NodeDef* node = graph->mutable_node(i);
+    if (node->name() == skip_node_name) continue;
+    for (int j = 0; j < node->input_size(); ++j) {
+      const string input = node->input(j);
+      if (!input.empty() && input[0] == '^') continue;
+      if (NodeNameFromInputLocal(input) == old_node_name) {
+        node->set_input(j, new_input);
+      }
+    }
+  }
+}
+
+int OptimizeForwardRmsNorm(GraphDef* graph) {
+  std::unordered_map<string, const NodeDef*> node_map;
+  node_map.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    node_map[node.name()] = &node;
+  }
+
+  std::unordered_map<string, std::vector<string>> consumers;
+  for (const auto& node : graph->node()) {
+    for (const auto& input : node.input()) {
+      if (!input.empty() && input[0] == '^') continue;
+      consumers[NodeNameFromInputLocal(input)].push_back(node.name());
+    }
+  }
+
+  auto find_node = [&](const string& input) -> const NodeDef* {
+    const auto it = node_map.find(NodeNameFromInputLocal(input));
+    return it == node_map.end() ? nullptr : it->second;
+  };
+
+  std::unordered_set<string> remove_names;
+  int rewrites = 0;
+  const int original_node_size = graph->node_size();
+  for (int i = 0; i < original_node_size; ++i) {
+    NodeDef* out = graph->mutable_node(i);
+    if (out->op() != "Mul" || out->input_size() != 2 ||
+        !HasFloatTypeAttr(*out) ||
+        out->name().find("rms_layer_norm") == string::npos ||
+        out->name().find("gradient_tape/") != string::npos ||
+        (!StringEndsWithLocal(out->name(), "/mul") &&
+         !StringEndsWithLocal(out->name(), "/mul_1"))) {
+      continue;
+    }
+
+    const NodeDef* in0 = find_node(out->input(0));
+    const NodeDef* in1 = find_node(out->input(1));
+    if (in0 == nullptr || in1 == nullptr) continue;
+
+    const NodeDef* norm = nullptr;
+    string gamma_input;
+    if ((in0->op() == "Mul" || in0->op() == "RealDiv" ||
+         in0->op() == "Div") && HasFloatTypeAttr(*in0)) {
+      norm = in0;
+      gamma_input = out->input(1);
+    } else if ((in1->op() == "Mul" || in1->op() == "RealDiv" ||
+                in1->op() == "Div") && HasFloatTypeAttr(*in1)) {
+      norm = in1;
+      gamma_input = out->input(0);
+    } else {
+      continue;
+    }
+    if (remove_names.find(norm->name()) != remove_names.end() ||
+        norm->input_size() != 2) {
+      continue;
+    }
+
+    const NodeDef* scale_node = find_node(gamma_input);
+    if (scale_node == nullptr || scale_node->op() != "ReadVariableOp") {
+      continue;
+    }
+
+    const NodeDef* inv_or_denom = nullptr;
+    string x_input;
+    bool denominator_is_sqrt = false;
+    if (norm->op() == "Mul") {
+      const NodeDef* norm_in0 = find_node(norm->input(0));
+      const NodeDef* norm_in1 = find_node(norm->input(1));
+      if (norm_in0 != nullptr && norm_in0->op() == "Rsqrt") {
+        inv_or_denom = norm_in0;
+        x_input = norm->input(1);
+      } else if (norm_in1 != nullptr && norm_in1->op() == "Rsqrt") {
+        inv_or_denom = norm_in1;
+        x_input = norm->input(0);
+      } else {
+        continue;
+      }
+    } else {
+      const NodeDef* norm_in0 = find_node(norm->input(0));
+      const NodeDef* norm_in1 = find_node(norm->input(1));
+      if (norm_in1 != nullptr && norm_in1->op() == "Sqrt") {
+        inv_or_denom = norm_in1;
+        x_input = norm->input(0);
+        denominator_is_sqrt = true;
+      } else if (norm_in0 != nullptr && norm_in0->op() == "Sqrt") {
+        inv_or_denom = norm_in0;
+        x_input = norm->input(1);
+        denominator_is_sqrt = true;
+      } else {
+        continue;
+      }
+    }
+    if (inv_or_denom == nullptr || inv_or_denom->input_size() != 1) continue;
+
+    const NodeDef* add = find_node(inv_or_denom->input(0));
+    if (add == nullptr || add->op() != "AddV2" || add->input_size() != 2 ||
+        !HasFloatTypeAttr(*add)) {
+      continue;
+    }
+
+    const NodeDef* add_in0 = find_node(add->input(0));
+    const NodeDef* add_in1 = find_node(add->input(1));
+    const NodeDef* mean = nullptr;
+    const NodeDef* eps = nullptr;
+    if (add_in0 != nullptr && add_in0->op() == "Mean" &&
+        add_in1 != nullptr && add_in1->op() == "Const") {
+      mean = add_in0;
+      eps = add_in1;
+    } else if (add_in1 != nullptr && add_in1->op() == "Mean" &&
+               add_in0 != nullptr && add_in0->op() == "Const") {
+      mean = add_in1;
+      eps = add_in0;
+    } else {
+      continue;
+    }
+    if (mean->input_size() != 2 || !HasFloatTypeAttr(*mean)) continue;
+
+    const auto keep_it = mean->attr().find("keep_dims");
+    if (keep_it == mean->attr().end() || !keep_it->second.b()) continue;
+
+    const NodeDef* square = find_node(mean->input(0));
+    const NodeDef* reduce = find_node(mean->input(1));
+    if (square == nullptr || reduce == nullptr || square->op() != "Square" ||
+        square->input_size() != 1 || !HasFloatTypeAttr(*square)) {
+      continue;
+    }
+    if (NodeNameFromInputLocal(square->input(0)) !=
+        NodeNameFromInputLocal(x_input)) {
+      continue;
+    }
+
+    std::vector<int64_t> reduction;
+    if (!GetConstIntVector(reduce, &reduction) || reduction.size() != 1 ||
+        reduction[0] != -1) {
+      continue;
+    }
+
+    float epsilon = 0.0f;
+    if (!GetConstScalarFloat(eps, &epsilon)) continue;
+
+    if (!IsOnlyConsumer(consumers, square->name(), mean->name()) ||
+        !IsOnlyConsumer(consumers, mean->name(), add->name()) ||
+        !IsOnlyConsumer(consumers, add->name(), inv_or_denom->name())) {
+      continue;
+    }
+
+    RedirectDataConsumersToInput(graph, norm->name(), out->name() + ":1",
+                                 out->name());
+    if (!denominator_is_sqrt) {
+      RedirectDataConsumersToInput(graph, inv_or_denom->name(),
+                                   out->name() + ":2", out->name());
+    }
+
+    out->set_op("MusaRmsNorm");
+    out->clear_input();
+    out->add_input(x_input);
+    out->add_input(gamma_input);
+    out->mutable_attr()->clear();
+    (*out->mutable_attr())["T"].set_type(DT_FLOAT);
+    (*out->mutable_attr())["epsilon"].set_f(epsilon);
+
+    remove_names.insert(norm->name());
+    if (!denominator_is_sqrt ||
+        IsOnlyConsumer(consumers, inv_or_denom->name(), norm->name())) {
+      remove_names.insert(inv_or_denom->name());
+      remove_names.insert(add->name());
+      remove_names.insert(mean->name());
+      remove_names.insert(square->name());
+      if (IsOnlyConsumer(consumers, eps->name(), add->name())) {
+        remove_names.insert(eps->name());
+      }
+      if (IsOnlyConsumer(consumers, reduce->name(), mean->name())) {
+        remove_names.insert(reduce->name());
+      }
+    }
+    rewrites++;
+  }
+
+  RemoveNodesByName(graph, remove_names);
+  if (rewrites > 0) {
+    LOG(INFO) << "MusaGraphOptimizer: Rewrote " << rewrites
+              << " forward RMSNorm node(s)";
+  }
+  return rewrites;
+}
+
+
+bool ReplaceTwoInputsWithFused(NodeDef* node, const string& first,
+                               const string& second,
+                               const string& fused_name) {
+  bool saw_first = false;
+  bool saw_second = false;
+  bool inserted = false;
+  std::vector<string> new_inputs;
+  new_inputs.reserve(node->input_size());
+  for (int i = 0; i < node->input_size(); ++i) {
+    const string clean = NodeNameFromInputLocal(node->input(i));
+    if (clean == first || clean == second) {
+      saw_first = saw_first || clean == first;
+      saw_second = saw_second || clean == second;
+      if (!inserted) {
+        new_inputs.push_back(fused_name);
+        inserted = true;
+      }
+      continue;
+    }
+    new_inputs.push_back(node->input(i));
+  }
+  if (!saw_first || !saw_second) return false;
+  node->clear_input();
+  for (const auto& input : new_inputs) node->add_input(input);
+  return true;
+}
+
+int OptimizeRmsNormGradDxWarp128(GraphDef* graph) {
+  std::unordered_map<string, const NodeDef*> node_map;
+  node_map.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    node_map[node.name()] = &node;
+  }
+
+  std::unordered_map<string, std::vector<string>> consumers;
+  for (const auto& node : graph->node()) {
+    for (const auto& input : node.input()) {
+      if (!input.empty() && input[0] == '^') continue;
+      consumers[NodeNameFromInputLocal(input)].push_back(node.name());
+    }
+  }
+
+  auto find_node = [&](const string& name) -> const NodeDef* {
+    const auto it = node_map.find(name);
+    return it == node_map.end() ? nullptr : it->second;
+  };
+
+  auto is_read_variable = [&](const string& input) -> bool {
+    const NodeDef* node = find_node(NodeNameFromInputLocal(input));
+    return node != nullptr && node->op() == "ReadVariableOp";
+  };
+
+  int rewrites = 0;
+  const int original_node_size = graph->node_size();
+  for (int i = 0; i < original_node_size; ++i) {
+    const NodeDef& direct = graph->node(i);
+    static const string kDirectSuffix = "/mul/Mul";
+    if (direct.op() != "Mul" || direct.input_size() != 2 ||
+        !HasFloatTypeAttr(direct) ||
+        direct.name().find("gradient_tape/") == string::npos ||
+        direct.name().find("rms_layer_norm") == string::npos ||
+        !StringEndsWithLocal(direct.name(), kDirectSuffix)) {
+      continue;
+    }
+
+    const string prefix =
+        direct.name().substr(0, direct.name().size() - kDirectSuffix.size());
+    const string correction_name = prefix + "/Mul_1";
+    const string dy_gamma_name = prefix + "/mul_1/Mul";
+    const string x_times_two_name = prefix + "/Mul";
+    const string fused_name = prefix + "/musa_rmsnorm_grad_dx";
+    if (node_map.find(fused_name) != node_map.end()) continue;
+
+    const NodeDef* correction = find_node(correction_name);
+    const NodeDef* dy_gamma = find_node(dy_gamma_name);
+    const NodeDef* x_times_two = find_node(x_times_two_name);
+    if (correction == nullptr || dy_gamma == nullptr ||
+        x_times_two == nullptr || correction->op() != "Mul" ||
+        dy_gamma->op() != "Mul" || x_times_two->op() != "Mul" ||
+        correction->input_size() != 2 || dy_gamma->input_size() != 2 ||
+        x_times_two->input_size() != 2 || !HasFloatTypeAttr(*correction) ||
+        !HasFloatTypeAttr(*dy_gamma) || !HasFloatTypeAttr(*x_times_two)) {
+      continue;
+    }
+
+    const auto direct_consumer_it = consumers.find(direct.name());
+    const auto correction_consumer_it = consumers.find(correction_name);
+    if (direct_consumer_it == consumers.end() ||
+        correction_consumer_it == consumers.end() ||
+        direct_consumer_it->second.size() != 1 ||
+        correction_consumer_it->second.size() != 1 ||
+        direct_consumer_it->second[0] != correction_consumer_it->second[0]) {
+      continue;
+    }
+
+    NodeDef* consumer = nullptr;
+    for (int node_idx = 0; node_idx < graph->node_size(); ++node_idx) {
+      if (graph->node(node_idx).name() == direct_consumer_it->second[0]) {
+        consumer = graph->mutable_node(node_idx);
+        break;
+      }
+    }
+    if (consumer == nullptr ||
+        (consumer->op() != "AddN" &&
+         consumer->op() != "MusaAddNWithSliceGrad")) {
+      continue;
+    }
+
+    string inv_input;
+    string dy_gamma_input;
+    for (int input_idx = 0; input_idx < 2; ++input_idx) {
+      const string clean = NodeNameFromInputLocal(direct.input(input_idx));
+      if (clean == dy_gamma_name) {
+        dy_gamma_input = direct.input(input_idx);
+      } else if (direct.input(input_idx).find(":2") != string::npos) {
+        inv_input = direct.input(input_idx);
+      }
+    }
+    if (inv_input.empty() || dy_gamma_input.empty()) continue;
+
+    string gamma_input;
+    string dy_input;
+    if (is_read_variable(dy_gamma->input(0))) {
+      gamma_input = dy_gamma->input(0);
+      dy_input = dy_gamma->input(1);
+    } else if (is_read_variable(dy_gamma->input(1))) {
+      gamma_input = dy_gamma->input(1);
+      dy_input = dy_gamma->input(0);
+    } else {
+      continue;
+    }
+
+    string x_input;
+    for (int input_idx = 0; input_idx < 2; ++input_idx) {
+      const NodeDef* producer =
+          find_node(NodeNameFromInputLocal(x_times_two->input(input_idx)));
+      if (producer != nullptr && producer->op() != "Const") {
+        x_input = x_times_two->input(input_idx);
+      }
+    }
+    if (x_input.empty()) continue;
+
+    NodeDef* fused = graph->add_node();
+    fused->set_name(fused_name);
+    fused->set_op("MusaRmsNormGradDx");
+    fused->set_device(direct.device());
+    fused->add_input(x_input);
+    fused->add_input(inv_input);
+    fused->add_input(gamma_input);
+    fused->add_input(dy_input);
+    (*fused->mutable_attr())["T"].set_type(DT_FLOAT);
+
+    if (!ReplaceTwoInputsWithFused(consumer, direct.name(), correction_name,
+                                   fused_name)) {
+      graph->mutable_node(graph->node_size() - 1)->set_name(
+          fused_name + "/unused");
+      continue;
+    }
+    if (consumer->op() == "AddN") {
+      (*consumer->mutable_attr())["N"].set_i(consumer->input_size());
+    } else {
+      const int old_n = consumer->attr().at("N").i();
+      (*consumer->mutable_attr())["N"].set_i(std::max(1, old_n - 1));
+    }
+    rewrites++;
+  }
+
+  if (rewrites > 0) {
+    LOG(INFO) << "MusaGraphOptimizer: Rewrote " << rewrites
+              << " RMSNorm grad dx node(s) with warp128 kernel";
+  }
+  return rewrites;
+}
+
+
+int OptimizeRmsNormSqrtGradDxWarp128(GraphDef* graph) {
+  std::unordered_map<string, const NodeDef*> node_map;
+  node_map.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    node_map[node.name()] = &node;
+  }
+
+  std::unordered_map<string, std::vector<string>> consumers;
+  for (const auto& node : graph->node()) {
+    for (const auto& input : node.input()) {
+      if (!input.empty() && input[0] == '^') continue;
+      consumers[NodeNameFromInputLocal(input)].push_back(node.name());
+    }
+  }
+
+  auto find_node = [&](const string& name) -> const NodeDef* {
+    const auto it = node_map.find(name);
+    return it == node_map.end() ? nullptr : it->second;
+  };
+
+  auto is_read_variable = [&](const string& input) -> bool {
+    const NodeDef* node = find_node(NodeNameFromInputLocal(input));
+    return node != nullptr && node->op() == "ReadVariableOp";
+  };
+
+  int rewrites = 0;
+  const int original_node_size = graph->node_size();
+  for (int i = 0; i < original_node_size; ++i) {
+    const NodeDef& direct = graph->node(i);
+    static const string kDirectSuffix = "/truediv/Reshape";
+    if (direct.op() != "Reshape" || !HasFloatTypeAttr(direct) ||
+        direct.name().find("gradient_tape/") == string::npos ||
+        direct.name().find("rms_layer_norm") == string::npos ||
+        !StringEndsWithLocal(direct.name(), kDirectSuffix)) {
+      continue;
+    }
+
+    const string prefix =
+        direct.name().substr(0, direct.name().size() - kDirectSuffix.size());
+    const string forward_prefix = prefix.substr(strlen("gradient_tape/"));
+    const string forward_fused_name = forward_prefix + "/mul";
+    const string correction_name = prefix + "/Mul_1";
+    const string dy_gamma_name = prefix + "/mul/Mul";
+    const string fused_name = prefix + "/musa_rmsnorm_grad_dx";
+    if (node_map.find(fused_name) != node_map.end()) continue;
+
+    const NodeDef* forward_fused = find_node(forward_fused_name);
+    const NodeDef* correction = find_node(correction_name);
+    const NodeDef* dy_gamma = find_node(dy_gamma_name);
+    if (forward_fused == nullptr || correction == nullptr ||
+        dy_gamma == nullptr || forward_fused->op() != "MusaRmsNorm" ||
+        correction->op() != "Mul" || dy_gamma->op() != "Mul" ||
+        forward_fused->input_size() != 2 || correction->input_size() != 2 ||
+        dy_gamma->input_size() != 2 || !HasFloatTypeAttr(*correction) ||
+        !HasFloatTypeAttr(*dy_gamma)) {
+      continue;
+    }
+
+    const auto direct_consumer_it = consumers.find(direct.name());
+    const auto correction_consumer_it = consumers.find(correction_name);
+    if (direct_consumer_it == consumers.end() ||
+        correction_consumer_it == consumers.end() ||
+        direct_consumer_it->second.size() != 1 ||
+        correction_consumer_it->second.size() != 1 ||
+        direct_consumer_it->second[0] != correction_consumer_it->second[0]) {
+      continue;
+    }
+
+    NodeDef* consumer = nullptr;
+    for (int node_idx = 0; node_idx < graph->node_size(); ++node_idx) {
+      if (graph->node(node_idx).name() == direct_consumer_it->second[0]) {
+        consumer = graph->mutable_node(node_idx);
+        break;
+      }
+    }
+    if (consumer == nullptr ||
+        (consumer->op() != "AddN" &&
+         consumer->op() != "MusaAddNWithSliceGrad")) {
+      continue;
+    }
+
+    string gamma_input;
+    string dy_input;
+    if (is_read_variable(dy_gamma->input(0))) {
+      gamma_input = dy_gamma->input(0);
+      dy_input = dy_gamma->input(1);
+    } else if (is_read_variable(dy_gamma->input(1))) {
+      gamma_input = dy_gamma->input(1);
+      dy_input = dy_gamma->input(0);
+    } else {
+      continue;
+    }
+
+    NodeDef* fused = graph->add_node();
+    fused->set_name(fused_name);
+    fused->set_op("MusaRmsNormGradDx");
+    fused->set_device(direct.device());
+    fused->add_input(forward_fused->input(0));
+    fused->add_input(forward_fused_name + ":2");
+    fused->add_input(gamma_input);
+    fused->add_input(dy_input);
+    (*fused->mutable_attr())["T"].set_type(DT_FLOAT);
+
+    if (!ReplaceTwoInputsWithFused(consumer, direct.name(), correction_name,
+                                   fused_name)) {
+      graph->mutable_node(graph->node_size() - 1)->set_name(
+          fused_name + "/unused");
+      continue;
+    }
+    if (consumer->op() == "AddN") {
+      (*consumer->mutable_attr())["N"].set_i(consumer->input_size());
+    } else {
+      const int old_n = consumer->attr().at("N").i();
+      (*consumer->mutable_attr())["N"].set_i(std::max(1, old_n - 1));
+    }
+    rewrites++;
+  }
+
+  if (rewrites > 0) {
+    LOG(INFO) << "MusaGraphOptimizer: Rewrote " << rewrites
+              << " Sqrt RMSNorm grad dx node(s) with warp128 kernel";
+  }
+  return rewrites;
+}
+
+bool ExtractGeluGradPrefix(const string& node_name, string* prefix) {
+  const size_t gelu_pos = node_name.find("/Gelu");
+  if (gelu_pos == string::npos) return false;
+  const size_t next_slash = node_name.find('/', gelu_pos + 1);
+  if (next_slash == string::npos) return false;
+  *prefix = node_name.substr(0, next_slash);
+  return prefix->find("gradient_tape/") == 0;
+}
+
+string StripGradientTapePrefix(const string& name) {
+  static const string kPrefix = "gradient_tape/";
+  if (name.compare(0, kPrefix.size(), kPrefix) != 0) return "";
+  return name.substr(kPrefix.size());
+}
+
+int OptimizeExactGeluGrad(GraphDef* graph) {
+  std::unordered_map<string, const NodeDef*> node_map;
+  node_map.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    node_map[node.name()] = &node;
+  }
+
+  auto find_node = [&](const string& name) -> const NodeDef* {
+    const auto it = node_map.find(NodeNameFromInputLocal(name));
+    return it == node_map.end() ? nullptr : it->second;
+  };
+
+  std::unordered_set<string> remove_names;
+  int rewrites = 0;
+  const int original_node_size = graph->node_size();
+  for (int i = 0; i < original_node_size; ++i) {
+    const NodeDef& addn = graph->node(i);
+    if (addn.op() != "AddN" || addn.input_size() != 2 ||
+        !HasFloatTypeAttr(addn)) {
+      continue;
+    }
+
+    const NodeDef* lhs = find_node(addn.input(0));
+    const NodeDef* rhs = find_node(addn.input(1));
+    if (lhs == nullptr || rhs == nullptr) continue;
+
+    string lhs_prefix;
+    string rhs_prefix;
+    if (!ExtractGeluGradPrefix(lhs->name(), &lhs_prefix) ||
+        !ExtractGeluGradPrefix(rhs->name(), &rhs_prefix) ||
+        lhs_prefix != rhs_prefix) {
+      continue;
+    }
+
+    const string forward_prefix = StripGradientTapePrefix(lhs_prefix);
+    if (forward_prefix.empty()) continue;
+
+    const NodeDef* forward_gelu = find_node(forward_prefix + "/mul_1");
+    const NodeDef* forward_add = find_node(forward_prefix + "/add");
+    const NodeDef* grad_mul = find_node(lhs_prefix + "/mul_1/Mul");
+    if (forward_gelu == nullptr || forward_add == nullptr ||
+        grad_mul == nullptr || forward_gelu->op() != "MusaGelu" ||
+        forward_gelu->input_size() < 1 || grad_mul->op() != "Mul" ||
+        grad_mul->input_size() != 2 || !HasFloatTypeAttr(*grad_mul)) {
+      continue;
+    }
+
+    string dy_input;
+    for (int input_idx = 0; input_idx < grad_mul->input_size(); ++input_idx) {
+      if (NodeNameFromInputLocal(grad_mul->input(input_idx)) !=
+          forward_add->name()) {
+        dy_input = grad_mul->input(input_idx);
+      }
+    }
+    if (dy_input.empty()) continue;
+
+    const string fused_name = addn.name() + "/musa_gelu_grad";
+    if (node_map.find(fused_name) != node_map.end()) continue;
+
+    NodeDef* fused = graph->add_node();
+    fused->set_name(fused_name);
+    fused->set_op("MusaGeluGrad");
+    fused->set_device(addn.device());
+    fused->add_input(forward_gelu->input(0));
+    fused->add_input(dy_input);
+    (*fused->mutable_attr())["T"].set_type(DT_FLOAT);
+
+    RedirectNodeOutputs(graph, addn.name(), fused_name);
+    remove_names.insert(addn.name());
+    rewrites++;
+  }
+
+  RemoveNodesByName(graph, remove_names);
+  if (rewrites > 0) {
+    LOG(INFO) << "MusaGraphOptimizer: Rewrote " << rewrites
+              << " exact GELU grad node(s)";
+  }
+  return rewrites;
+}
+
+
+
+bool IsFloatOp(const NodeDef& node) {
+  const auto it = node.attr().find("T");
+  return it != node.attr().end() && it->second.type() == DT_FLOAT;
+}
+
+bool IsReductionIndexMinusOne(const NodeDef* node) {
+  std::vector<int64_t> values;
+  return GetConstIntVector(node, &values) && values.size() == 1 &&
+         values[0] == -1;
+}
+
+int OptimizeSoftmaxGradSmallLastDim(GraphDef* graph) {
+  std::unordered_map<string, const NodeDef*> node_map;
+  node_map.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    node_map[node.name()] = &node;
+  }
+
+  std::unordered_map<string, std::vector<string>> consumers;
+  consumers.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    for (const auto& input : node.input()) {
+      if (!input.empty() && input[0] != '^') {
+        consumers[NodeNameFromInputLocal(input)].push_back(node.name());
+      }
+    }
+  }
+
+  auto find_node = [&](const string& input) -> const NodeDef* {
+    const auto it = node_map.find(NodeNameFromInputLocal(input));
+    return it == node_map.end() ? nullptr : it->second;
+  };
+
+  std::unordered_set<string> remove_names;
+  int rewrites = 0;
+  const int original_node_size = graph->node_size();
+  for (int i = 0; i < original_node_size; ++i) {
+    const NodeDef& final_mul = graph->node(i);
+    if (final_mul.op() != "Mul" || final_mul.input_size() != 2 ||
+        !IsFloatOp(final_mul) ||
+        final_mul.name().find("pyramid_mixed_causal_attention") ==
+            string::npos) {
+      continue;
+    }
+
+    const NodeDef* sub = nullptr;
+    const NodeDef* softmax = nullptr;
+    for (int input_idx = 0; input_idx < 2; ++input_idx) {
+      const NodeDef* candidate = find_node(final_mul.input(input_idx));
+      if (candidate == nullptr) continue;
+      if (candidate->op() == "Sub") {
+        sub = candidate;
+      } else if (candidate->op() == "Softmax") {
+        softmax = candidate;
+      }
+    }
+    if (sub == nullptr || softmax == nullptr || sub->input_size() != 2 ||
+        !IsFloatOp(*sub) ||
+        !IsOnlyConsumer(consumers, sub->name(), final_mul.name())) {
+      continue;
+    }
+
+    const NodeDef* sum = find_node(sub->input(1));
+    if (sum == nullptr || sum->op() != "Sum" || sum->input_size() != 2 ||
+        !IsFloatOp(*sum) ||
+        !IsOnlyConsumer(consumers, sum->name(), sub->name())) {
+      continue;
+    }
+    const auto keep_dims_it = sum->attr().find("keep_dims");
+    if (keep_dims_it == sum->attr().end() || !keep_dims_it->second.b()) {
+      continue;
+    }
+    if (!IsReductionIndexMinusOne(find_node(sum->input(1)))) {
+      continue;
+    }
+
+    const NodeDef* first_mul = find_node(sum->input(0));
+    if (first_mul == nullptr || first_mul->op() != "Mul" ||
+        first_mul->input_size() != 2 || !IsFloatOp(*first_mul) ||
+        !IsOnlyConsumer(consumers, first_mul->name(), sum->name())) {
+      continue;
+    }
+
+    const string dy_input = sub->input(0);
+    const string softmax_name = softmax->name();
+    bool first_mul_has_dy = false;
+    bool first_mul_has_softmax = false;
+    for (const auto& input : first_mul->input()) {
+      const string clean = NodeNameFromInputLocal(input);
+      if (clean == NodeNameFromInputLocal(dy_input)) first_mul_has_dy = true;
+      if (clean == softmax_name) first_mul_has_softmax = true;
+    }
+    if (!first_mul_has_dy || !first_mul_has_softmax) continue;
+    if (NodeNameFromInputLocal(final_mul.input(0)) != sub->name() &&
+        NodeNameFromInputLocal(final_mul.input(1)) != sub->name()) {
+      continue;
+    }
+
+    const string fused_name = final_mul.name() + "/musa_softmax_grad";
+    if (node_map.find(fused_name) != node_map.end()) continue;
+    NodeDef* fused = graph->add_node();
+    fused->set_name(fused_name);
+    fused->set_op("MusaSoftmaxGrad");
+    fused->set_device(final_mul.device());
+    fused->add_input(softmax->name());
+    fused->add_input(dy_input);
+
+    RedirectNodeOutputs(graph, final_mul.name(), fused_name);
+    remove_names.insert(final_mul.name());
+    remove_names.insert(sub->name());
+    remove_names.insert(sum->name());
+    remove_names.insert(first_mul->name());
+    rewrites++;
+  }
+
+  RemoveNodesByName(graph, remove_names);
+  if (rewrites > 0) {
+    LOG(INFO) << "MusaGraphOptimizer: Rewrote " << rewrites
+              << " softmax grad node(s) with MusaSoftmaxGrad";
+  }
+  return rewrites;
+}
+
+
+int OptimizeSliceGradAddNConcat(GraphDef* graph) {
+  std::unordered_map<string, const NodeDef*> node_map;
+  node_map.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    node_map[node.name()] = &node;
+  }
+
+  std::unordered_map<string, std::vector<string>> consumers;
+  for (const auto& node : graph->node()) {
+    for (const auto& input : node.input()) {
+      if (!input.empty() && input[0] == '^') continue;
+      consumers[NodeNameFromInputLocal(input)].push_back(node.name());
+    }
+  }
+
+  std::unordered_set<string> remove_names;
+  int rewrites = 0;
+  const int original_node_size = graph->node_size();
+  for (int i = 0; i < original_node_size; ++i) {
+    const NodeDef& addn = graph->node(i);
+    if (addn.op() != "AddN" || addn.input_size() != 2) continue;
+    const auto t_it = addn.attr().find("T");
+    if (t_it == addn.attr().end() || t_it->second.type() != DT_FLOAT) {
+      continue;
+    }
+
+    const NodeDef* lhs =
+        node_map.count(NodeNameFromInputLocal(addn.input(0)))
+            ? node_map[NodeNameFromInputLocal(addn.input(0))]
+            : nullptr;
+    const NodeDef* rhs =
+        node_map.count(NodeNameFromInputLocal(addn.input(1)))
+            ? node_map[NodeNameFromInputLocal(addn.input(1))]
+            : nullptr;
+    SliceGradSegment a;
+    SliceGradSegment b;
+    if (lhs == nullptr || rhs == nullptr ||
+        consumers[NodeNameFromInputLocal(addn.input(0))].size() != 1 ||
+        consumers[NodeNameFromInputLocal(addn.input(1))].size() != 1 ||
+        consumers[NodeNameFromInputLocal(addn.input(0))][0] != addn.name() ||
+        consumers[NodeNameFromInputLocal(addn.input(1))][0] != addn.name()) {
+      continue;
+    }
+
+    const NodeDef* first_segment = nullptr;
+    const NodeDef* second_segment = nullptr;
+    string first_dy;
+    string second_dy;
+    bool matched = false;
+
+    if (TryParseConstAxis1SliceGrad(*lhs, node_map, &a) &&
+        TryParseConstAxis1SliceGrad(*rhs, node_map, &b) &&
+        a.output_shape == b.output_shape && a.end == b.start &&
+        a.start == 0 && b.end == a.output_shape[1]) {
+      first_segment = a.node;
+      second_segment = b.node;
+      first_dy = a.dy_input;
+      second_dy = b.dy_input;
+      matched = true;
+    }
+
+    if (!matched) {
+      DynamicSliceGradSegment da;
+      DynamicSliceGradSegment db;
+      if (TryParseDynamicAxis1SliceGrad(*lhs, node_map, &da) &&
+          TryParseDynamicAxis1SliceGrad(*rhs, node_map, &db) &&
+          da.output_shape == db.output_shape &&
+          da.split_input == db.split_input &&
+          da.is_prefix != db.is_prefix) {
+        const DynamicSliceGradSegment& prefix = da.is_prefix ? da : db;
+        const DynamicSliceGradSegment& suffix = da.is_prefix ? db : da;
+        first_segment = prefix.node;
+        second_segment = suffix.node;
+        first_dy = prefix.dy_input;
+        second_dy = suffix.dy_input;
+        matched = true;
+      }
+    }
+
+    if (!matched) {
+      continue;
+    }
+
+    const string concat_name = addn.name() + "/musa_slice_grad_concat";
+    const string axis_name = concat_name + "/axis";
+
+    NodeDef* axis = graph->add_node();
+    axis->set_name(axis_name);
+    axis->set_op("Const");
+    auto* axis_attr = axis->mutable_attr();
+    (*axis_attr)["dtype"].set_type(DT_INT32);
+    TensorProto* axis_tensor = (*axis_attr)["value"].mutable_tensor();
+    axis_tensor->set_dtype(DT_INT32);
+    axis_tensor->add_int_val(1);
+
+    NodeDef* concat = graph->add_node();
+    concat->set_name(concat_name);
+    concat->set_op("ConcatV2");
+    concat->set_device(addn.device());
+    concat->add_input(first_dy);
+    concat->add_input(second_dy);
+    concat->add_input(axis_name);
+    auto* concat_attr = concat->mutable_attr();
+    (*concat_attr)["N"].set_i(2);
+    (*concat_attr)["T"].set_type(DT_FLOAT);
+    (*concat_attr)["Tidx"].set_type(DT_INT32);
+
+    RedirectNodeOutputs(graph, addn.name(), concat_name);
+    remove_names.insert(addn.name());
+    remove_names.insert(first_segment->name());
+    remove_names.insert(second_segment->name());
+    rewrites++;
+  }
+
+  RemoveNodesByName(graph, remove_names);
+  if (rewrites > 0) {
+    LOG(INFO) << "MusaGraphOptimizer: Rewrote " << rewrites
+              << " StridedSliceGrad+AddN pair(s) to ConcatV2";
+  }
+  return rewrites;
+}
+
+
+int OptimizeAddNWithSuffixSliceGrad(GraphDef* graph) {
+  std::unordered_map<string, const NodeDef*> node_map;
+  node_map.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    node_map[node.name()] = &node;
+  }
+
+  std::unordered_map<string, std::vector<string>> consumers;
+  for (const auto& node : graph->node()) {
+    for (const auto& input : node.input()) {
+      if (!input.empty() && input[0] == '^') continue;
+      consumers[NodeNameFromInputLocal(input)].push_back(node.name());
+    }
+  }
+
+  std::unordered_set<string> remove_names;
+  int rewrites = 0;
+  const int original_node_size = graph->node_size();
+  for (int i = 0; i < original_node_size; ++i) {
+    const NodeDef& addn = graph->node(i);
+    if (addn.op() != "AddN" || addn.input_size() < 2 ||
+        addn.input_size() > 9) {
+      continue;
+    }
+    const auto t_it = addn.attr().find("T");
+    if (t_it == addn.attr().end() || t_it->second.type() != DT_FLOAT) {
+      continue;
+    }
+
+    int slice_input_idx = -1;
+    SliceGradSegment segment;
+    int64_t inner_dim = 1;
+    for (int input_idx = 0; input_idx < addn.input_size(); ++input_idx) {
+      const string producer_name = NodeNameFromInputLocal(addn.input(input_idx));
+      const auto node_it = node_map.find(producer_name);
+      if (node_it == node_map.end()) continue;
+      SliceGradSegment candidate;
+      int64_t candidate_inner_dim = 1;
+      if (!TryParseConstAxis1SuffixSliceGrad(*node_it->second, node_map,
+                                             &candidate,
+                                             &candidate_inner_dim)) {
+        continue;
+      }
+      if (consumers[producer_name].size() != 1 ||
+          consumers[producer_name][0] != addn.name()) {
+        continue;
+      }
+      if (slice_input_idx != -1) {
+        slice_input_idx = -1;
+        break;
+      }
+      slice_input_idx = input_idx;
+      segment = std::move(candidate);
+      inner_dim = candidate_inner_dim;
+    }
+    if (slice_input_idx == -1) continue;
+
+    const int num_base_inputs = addn.input_size() - 1;
+    const string fused_name = addn.name() + "/musa_addn_slice_grad";
+    NodeDef* fused = graph->add_node();
+    fused->set_name(fused_name);
+    fused->set_op("MusaAddNWithSliceGrad");
+    fused->set_device(addn.device());
+    for (int input_idx = 0; input_idx < addn.input_size(); ++input_idx) {
+      if (input_idx == slice_input_idx) continue;
+      fused->add_input(addn.input(input_idx));
+    }
+    fused->add_input(segment.dy_input);
+
+    auto* attr = fused->mutable_attr();
+    (*attr)["N"].set_i(num_base_inputs);
+    (*attr)["T"].set_type(DT_FLOAT);
+    (*attr)["axis_dim"].set_i(segment.output_shape[1]);
+    (*attr)["slice_start"].set_i(segment.start);
+    (*attr)["inner_dim"].set_i(inner_dim);
+
+    RedirectNodeOutputs(graph, addn.name(), fused_name);
+    remove_names.insert(addn.name());
+    remove_names.insert(segment.node->name());
+    rewrites++;
+  }
+
+  RemoveNodesByName(graph, remove_names);
+  if (rewrites > 0) {
+    LOG(INFO) << "MusaGraphOptimizer: Rewrote " << rewrites
+              << " AddN+suffix StridedSliceGrad node(s)";
+  }
+  return rewrites;
+}
+
+int OptimizeConcatWithSuffixSliceGrad(GraphDef* graph) {
+  std::unordered_map<string, const NodeDef*> node_map;
+  node_map.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    node_map[node.name()] = &node;
+  }
+
+  std::unordered_map<string, std::vector<string>> consumers;
+  for (const auto& node : graph->node()) {
+    for (const auto& input : node.input()) {
+      if (!input.empty() && input[0] == '^') continue;
+      consumers[NodeNameFromInputLocal(input)].push_back(node.name());
+    }
+  }
+
+  std::unordered_set<string> remove_names;
+  int rewrites = 0;
+  const int original_node_size = graph->node_size();
+  for (int i = 0; i < original_node_size; ++i) {
+    const NodeDef& concat = graph->node(i);
+    if (concat.op() != "ConcatV2" || concat.input_size() != 4) continue;
+    const auto n_it = concat.attr().find("N");
+    const auto t_it = concat.attr().find("T");
+    if (n_it == concat.attr().end() || n_it->second.i() != 3 ||
+        t_it == concat.attr().end() || t_it->second.type() != DT_FLOAT) {
+      continue;
+    }
+
+    const string axis_name = NodeNameFromInputLocal(concat.input(3));
+    const auto axis_it = node_map.find(axis_name);
+    if (axis_it == node_map.end() || !IsConstLastAxis(axis_it->second)) {
+      continue;
+    }
+
+    const string slice_name = NodeNameFromInputLocal(concat.input(0));
+    const auto slice_it = node_map.find(slice_name);
+    if (slice_it == node_map.end()) continue;
+    if (consumers[slice_name].size() != 1 ||
+        consumers[slice_name][0] != concat.name()) {
+      continue;
+    }
+
+    SliceGradSegment segment;
+    int64_t inner_dim = 1;
+    if (!TryParseConstAxis1SuffixSliceGrad(*slice_it->second, node_map,
+                                           &segment, &inner_dim)) {
+      continue;
+    }
+    if (segment.output_shape.size() != 3 ||
+        inner_dim != segment.output_shape[2]) {
+      continue;
+    }
+
+    const string fused_name = concat.name() + "/musa_concat_slice_grad";
+    NodeDef* fused = graph->add_node();
+    fused->set_name(fused_name);
+    fused->set_op("MusaConcatWithSliceGrad");
+    fused->set_device(concat.device());
+    fused->add_input(segment.dy_input);
+    fused->add_input(concat.input(1));
+    fused->add_input(concat.input(2));
+
+    auto* attr = fused->mutable_attr();
+    (*attr)["T"].set_type(DT_FLOAT);
+    (*attr)["axis_dim"].set_i(segment.output_shape[1]);
+    (*attr)["slice_start"].set_i(segment.start);
+    (*attr)["inner_dim"].set_i(inner_dim);
+
+    RedirectNodeOutputs(graph, concat.name(), fused_name);
+    remove_names.insert(concat.name());
+    remove_names.insert(segment.node->name());
+    rewrites++;
+  }
+
+  RemoveNodesByName(graph, remove_names);
+  if (rewrites > 0) {
+    LOG(INFO) << "MusaGraphOptimizer: Rewrote " << rewrites
+              << " ConcatV2+suffix StridedSliceGrad node(s)";
+  }
+  return rewrites;
 }
 
 }  // namespace
@@ -447,6 +1826,55 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
       dumper.DumpAfterPass(*optimized_graph, "fusion");
     }
 
+    const int forward_rmsnorm_rewrites =
+        OptimizeForwardRmsNorm(optimized_graph);
+    if (forward_rmsnorm_rewrites > 0) {
+      dumper.DumpAtStage(*optimized_graph, "after_forward_rmsnorm_fusion");
+    }
+
+    const int slice_grad_addn_rewrites =
+        OptimizeSliceGradAddNConcat(optimized_graph);
+    if (slice_grad_addn_rewrites > 0) {
+      dumper.DumpAtStage(*optimized_graph, "after_slice_grad_addn_concat");
+    }
+
+    const int addn_slice_grad_rewrites =
+        OptimizeAddNWithSuffixSliceGrad(optimized_graph);
+    if (addn_slice_grad_rewrites > 0) {
+      dumper.DumpAtStage(*optimized_graph,
+                         "after_addn_suffix_slice_grad_fusion");
+    }
+    const int concat_slice_grad_rewrites =
+        OptimizeConcatWithSuffixSliceGrad(optimized_graph);
+    if (concat_slice_grad_rewrites > 0) {
+      dumper.DumpAtStage(*optimized_graph,
+                         "after_concat_suffix_slice_grad_fusion");
+    }
+    const int gelu_grad_rewrites = OptimizeExactGeluGrad(optimized_graph);
+    if (gelu_grad_rewrites > 0) {
+      dumper.DumpAtStage(*optimized_graph,
+                         "after_exact_gelu_grad_fusion");
+    }
+
+    const int softmax_grad_rewrites =
+        OptimizeSoftmaxGradSmallLastDim(optimized_graph);
+    if (softmax_grad_rewrites > 0) {
+      dumper.DumpAtStage(*optimized_graph,
+                         "after_softmax_grad_fusion");
+    }
+
+    const int rms_norm_grad_dx_rewrites =
+        OptimizeRmsNormGradDxWarp128(optimized_graph);
+    if (rms_norm_grad_dx_rewrites > 0) {
+      dumper.DumpAtStage(*optimized_graph,
+                         "after_rmsnorm_grad_dx_warp128_fusion");
+    }
+    const int rms_norm_sqrt_grad_dx_rewrites =
+        OptimizeRmsNormSqrtGradDxWarp128(optimized_graph);
+    if (rms_norm_sqrt_grad_dx_rewrites > 0) {
+      dumper.DumpAtStage(*optimized_graph,
+                         "after_rmsnorm_sqrt_grad_dx_warp128_fusion");
+    }
     if (configs_.optimizer_remove_ios_node != TriState::kOff) {
       const int removed_isolated_nodes = RemoveIsolatedNodes(optimized_graph);
       if (removed_isolated_nodes > 0) {
@@ -916,6 +2344,46 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
 };
 
 REGISTER_GRAPH_OPTIMIZER_AS(MusaGraphOptimizer, "musa_graph_optimizer");
+
+class MusaAutoGraphOptimizationPass : public ::tensorflow::GraphOptimizationPass {
+ public:
+  Status Run(const ::tensorflow::GraphOptimizationPassOptions& options) override {
+    if (options.graph == nullptr || options.graph->get() == nullptr) {
+      return Status::OK();
+    }
+
+    GraphDef graph_def;
+    (*options.graph)->ToGraphDef(&graph_def);
+    if (graph_def.node_size() == 0) {
+      return Status::OK();
+    }
+
+    GrapplerItem item;
+    item.id = "musa_auto_graph_pass";
+    item.graph = graph_def;
+
+    MusaGraphOptimizer optimizer;
+    TF_RETURN_IF_ERROR(optimizer.Init(nullptr));
+
+    GraphDef optimized_graph_def;
+    TF_RETURN_IF_ERROR(optimizer.Optimize(nullptr, item, &optimized_graph_def));
+
+    std::unique_ptr<::tensorflow::Graph> new_graph(
+        new ::tensorflow::Graph((*options.graph)->op_registry()));
+    ::tensorflow::GraphConstructorOptions constructor_opts;
+    constructor_opts.allow_internal_ops = true;
+    constructor_opts.add_default_attributes = true;
+    TF_RETURN_IF_ERROR(::tensorflow::ConvertGraphDefToGraph(
+        constructor_opts, std::move(optimized_graph_def), new_graph.get()));
+    options.graph->swap(new_graph);
+    LOG(INFO) << "MusaAutoGraphOptimizationPass applied to graph with "
+              << graph_def.node_size() << " node(s)";
+    return Status::OK();
+  }
+};
+
+REGISTER_OPTIMIZATION(::tensorflow::OptimizationPassRegistry::PRE_PLACEMENT, 60,
+                      MusaAutoGraphOptimizationPass);
 
 }  // namespace grappler
 }  // namespace tensorflow
