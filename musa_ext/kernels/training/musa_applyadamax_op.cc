@@ -62,7 +62,7 @@ inline Status ValidateAdaMaxHyperParams(OpKernelContext* ctx) {
       return errors::InvalidArgument(name, " must be a scalar, got shape ",
                                      t.shape().DebugString());
     }
-    return Status::OK();
+    return ::tensorflow::OkStatus();
   };
 
   // AdaMax uses: var, m, v, beta1_power, lr, beta1, beta2, epsilon, grad
@@ -72,7 +72,7 @@ inline Status ValidateAdaMaxHyperParams(OpKernelContext* ctx) {
   TF_RETURN_IF_ERROR(require_scalar(5, "beta1"));
   TF_RETURN_IF_ERROR(require_scalar(6, "beta2"));
   TF_RETURN_IF_ERROR(require_scalar(7, "epsilon"));
-  return Status::OK();
+  return ::tensorflow::OkStatus();
 }
 
 // Validate that var, m, v, and grad have the same shape
@@ -96,7 +96,7 @@ inline Status ValidateAdaMaxShapes(const Tensor& var_t, const Tensor& m_t,
         var_t.shape().DebugString(), " grad: ", grad_t.shape().DebugString());
   }
 
-  return Status::OK();
+  return ::tensorflow::OkStatus();
 }
 
 template <typename T>
@@ -116,7 +116,7 @@ Status RunAdaMaxUpdate(OpKernelContext* ctx, mFormat format, Tensor* var_t,
                               " failed. Status: ",
                               static_cast<int>(status));
     }
-    return Status::OK();
+    return ::tensorflow::OkStatus();
   };
 
   auto fill_scalar = [&](T val, const TensorShape& shape,
@@ -254,7 +254,7 @@ Status RunAdaMaxUpdate(OpKernelContext* ctx, mFormat format, Tensor* var_t,
                             musaGetErrorString(sync_err));
   }
 
-  return Status::OK();
+  return ::tensorflow::OkStatus();
 }
 
 template <typename T>

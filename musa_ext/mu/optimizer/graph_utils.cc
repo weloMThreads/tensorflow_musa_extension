@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include "mu/optimizer/graph_utils.h"
+#include "tensorflow/core/lib/core/errors.h"
 
 #include <chrono>
 #include <cstdint>
@@ -96,8 +97,7 @@ Status WriteGraphDefPbtxt(const GraphDef& graph_def,
                           const std::string& filepath) {
   std::ofstream file(filepath, std::ios::out | std::ios::trunc);
   if (!file.is_open()) {
-    return Status(tensorflow::error::INTERNAL,
-                  "Failed to open file for writing: " + filepath);
+    return errors::Internal("Failed to open file for writing: " + filepath);
   }
 
   {
@@ -109,22 +109,19 @@ Status WriteGraphDefPbtxt(const GraphDef& graph_def,
     protobuf::io::OstreamOutputStream output_stream(&file);
     protobuf::TextFormat::Printer printer;
     if (!printer.Print(graph_def, &output_stream)) {
-      return Status(tensorflow::error::INTERNAL,
-                    "Failed to serialize GraphDef to text format");
+      return errors::Internal("Failed to serialize GraphDef to text format");
     }
   }
 
   file.flush();
   if (!file.good()) {
-    return Status(tensorflow::error::INTERNAL,
-                  "Failed to flush GraphDef text to file: " + filepath);
+    return errors::Internal("Failed to flush GraphDef text to file: " + filepath);
   }
   file.close();
   if (file.fail()) {
-    return Status(tensorflow::error::INTERNAL,
-                  "Failed to close GraphDef text file: " + filepath);
+    return errors::Internal("Failed to close GraphDef text file: " + filepath);
   }
-  return Status::OK();
+  return ::tensorflow::OkStatus();
 }
 
 Status WriteGraphDefBinary(const GraphDef& graph_def,
@@ -132,17 +129,15 @@ Status WriteGraphDefBinary(const GraphDef& graph_def,
   std::ofstream file(filepath,
                      std::ios::out | std::ios::binary | std::ios::trunc);
   if (!file.is_open()) {
-    return Status(tensorflow::error::INTERNAL,
-                  "Failed to open file for writing: " + filepath);
+    return errors::Internal("Failed to open file for writing: " + filepath);
   }
 
   if (!graph_def.SerializeToOstream(&file)) {
-    return Status(tensorflow::error::INTERNAL,
-                  "Failed to serialize GraphDef to binary format");
+    return errors::Internal("Failed to serialize GraphDef to binary format");
   }
 
   file.close();
-  return Status::OK();
+  return ::tensorflow::OkStatus();
 }
 
 void ClearKnownFieldIfPresent(protobuf::Message* message,
@@ -371,7 +366,7 @@ bool IsGraphDefDumpingEnabled() { return EnvFlagEnabled("MUSA_DUMP_GRAPHDEF"); }
 Status DumpGraphDef(const GraphDef& graph_def, const std::string& prefix,
                     const std::string& stage_description) {
   if (!IsGraphDefDumpingEnabled()) {
-    return Status::OK();
+    return ::tensorflow::OkStatus();
   }
 
   std::string dump_dir = GetDumpDirectory();
@@ -447,7 +442,7 @@ Status DumpGraphDef(const GraphDef& graph_def, const std::string& prefix,
     }
   }
 
-  return Status::OK();
+  return ::tensorflow::OkStatus();
 }
 
 // Initialize static member

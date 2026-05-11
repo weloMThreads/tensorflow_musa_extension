@@ -166,12 +166,11 @@ FusionMatchResult BiasAddReluMatMulFusion::Match(const GraphDef& graph,
 Status BiasAddReluMatMulFusion::Apply(
     GraphDef* graph, const FusionMatchResult& match_result) const {
   if (!match_result.IsValid()) {
-    return Status(error::INVALID_ARGUMENT,
-                  "Invalid BiasAddReluMatMul match result");
+    return errors::InvalidArgument("Invalid BiasAddReluMatMul match result");
   }
 
   if (!IsKernelAvailable()) {
-    return Status::OK();
+    return ::tensorflow::OkStatus();
   }
 
   auto output_it = match_result.captured_nodes.find("output");
@@ -183,8 +182,7 @@ Status BiasAddReluMatMulFusion::Apply(
       matmul_it == match_result.captured_nodes.end() ||
       relu_it == match_result.captured_nodes.end() ||
       bias_add_it == match_result.captured_nodes.end()) {
-    return Status(error::INVALID_ARGUMENT,
-                  "Missing required nodes in BiasAddReluMatMul pattern");
+    return errors::InvalidArgument("Missing required nodes in BiasAddReluMatMul pattern");
   }
 
   const NodeDef* output_node = output_it->second;
@@ -200,7 +198,7 @@ Status BiasAddReluMatMulFusion::Apply(
     if (node.name() == original_name && node.op() == "MusaBiasAddReluMatMul") {
       VLOG(1) << "MusaBiasAddReluMatMul: Output node " << original_name
               << " is already fused, skipping";
-      return Status::OK();
+      return ::tensorflow::OkStatus();
     }
   }
 
@@ -213,8 +211,7 @@ Status BiasAddReluMatMulFusion::Apply(
   }
 
   if (output_node_idx < 0) {
-    return Status(error::INVALID_ARGUMENT,
-                  "Failed to find output node in graph: " + original_name);
+    return errors::InvalidArgument("Failed to find output node in graph: " + original_name);
   }
 
   VLOG(1) << "BiasAddReluMatMulFusion: Replacing " << original_name
@@ -257,8 +254,7 @@ Status BiasAddReluMatMulFusion::Apply(
   }
 
   if (relu_input_slot < 0) {
-    return Status(error::INVALID_ARGUMENT,
-                  "Failed to determine Relu input slot of MatMul");
+    return errors::InvalidArgument("Failed to determine Relu input slot of MatMul");
   }
 
   const std::string other_input =
@@ -302,7 +298,7 @@ Status BiasAddReluMatMulFusion::Apply(
   VLOG(1) << "BiasAddReluMatMulFusion: Successfully replaced '" << original_name
           << "' with MusaBiasAddReluMatMul";
 
-  return Status::OK();
+  return ::tensorflow::OkStatus();
 }
 
 REGISTER_FUSION_PATTERN(BiasAddReluMatMulFusion);

@@ -22,6 +22,7 @@ limitations under the License.
 #include <string>
 #include <unordered_set>
 #include <vector>
+#include "tensorflow/core/lib/core/errors.h"
 
 #include "tensorflow/core/framework/graph.pb.h"
 #include "tensorflow/core/framework/node_def.pb.h"

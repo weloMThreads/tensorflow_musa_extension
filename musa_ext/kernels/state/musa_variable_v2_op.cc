@@ -37,7 +37,7 @@ class MusaVariableV2Op : public OpKernel {
                             container_, shared_name_, &var,
                             [dtype, this](Var** ptr) -> Status {
                               *ptr = new Var(dtype);
-                              return Status::OK();
+                              return ::tensorflow::OkStatus();
                             }));
 
     core::ScopedUnref unref(var);

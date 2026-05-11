@@ -601,11 +601,11 @@ FusionMatchResult MusaGeluFusion::MatchApproximatePattern(
 Status MusaGeluFusion::Apply(GraphDef* graph,
                              const FusionMatchResult& match_result) const {
   if (!match_result.IsValid()) {
-    return Status(error::INVALID_ARGUMENT, "Invalid GELU match result");
+    return errors::InvalidArgument("Invalid GELU match result");
   }
 
   if (!IsKernelAvailable()) {
-    return Status::OK();
+    return ::tensorflow::OkStatus();
   }
 
   auto output_it = match_result.captured_nodes.find("output");
@@ -613,8 +613,7 @@ Status MusaGeluFusion::Apply(GraphDef* graph,
   if (output_it == match_result.captured_nodes.end() ||
       input_it == match_result.captured_nodes.end() || !output_it->second ||
       !input_it->second) {
-    return Status(error::INVALID_ARGUMENT,
-                  "Missing required nodes in GELU pattern");
+    return errors::InvalidArgument("Missing required nodes in GELU pattern");
   }
 
   const NodeDef* output_node = output_it->second;
@@ -648,7 +647,7 @@ Status MusaGeluFusion::Apply(GraphDef* graph,
     if (node.name() == original_name && node.op() == "MusaGelu") {
       // VLOG(1) << "MusaGeluFusion: fused node already exists for "
       //         << original_name;
-      return Status::OK();
+      return ::tensorflow::OkStatus();
     }
   }
 
@@ -660,8 +659,7 @@ Status MusaGeluFusion::Apply(GraphDef* graph,
     }
   }
   if (output_node_idx < 0) {
-    return Status(error::INVALID_ARGUMENT,
-                  "Failed to find output node in graph: " + original_name);
+    return errors::InvalidArgument("Failed to find output node in graph: " + original_name);
   }
 
   NodeDef* original_output_node = graph->mutable_node(output_node_idx);
@@ -696,7 +694,7 @@ Status MusaGeluFusion::Apply(GraphDef* graph,
   //         << ", matched_nodes=" << match_result.matched_nodes.size()
   //         << ", removed_nodes=" << removed_count << ")";
 
-  return Status::OK();
+  return ::tensorflow::OkStatus();
 }
 
 REGISTER_FUSION_PATTERN(MusaGeluFusion);
