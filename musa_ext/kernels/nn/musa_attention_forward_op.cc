@@ -59,10 +59,12 @@ class MusaCausalAttentionForwardOp : public MusaOpKernel {
                     "MusaCausalAttentionForward invalid shape"));
 
     TensorShape softmax_shape;
-    softmax_shape.AddDim(batch);
-    softmax_shape.AddDim(heads);
-    softmax_shape.AddDim(query_dim);
-    softmax_shape.AddDim(key_dim);
+    if (store_softmax_) {
+      softmax_shape.AddDim(batch);
+      softmax_shape.AddDim(heads);
+      softmax_shape.AddDim(query_dim);
+      softmax_shape.AddDim(key_dim);
+    }
     Tensor* softmax = nullptr;
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, softmax_shape, &softmax));
 
@@ -107,9 +109,15 @@ REGISTER_OP("MusaCausalAttentionForward")
       ::tensorflow::shape_inference::ShapeHandle key;
       TF_RETURN_IF_ERROR(c->WithRank(c->input(0), 4, &query));
       TF_RETURN_IF_ERROR(c->WithRank(c->input(1), 4, &key));
-      c->set_output(0,
-                    c->MakeShape({c->Dim(query, 0), c->Dim(query, 1),
-                                  c->Dim(query, 2), c->Dim(key, 2)}));
+      bool store_softmax = true;
+      TF_RETURN_IF_ERROR(c->GetAttr("store_softmax", &store_softmax));
+      if (store_softmax) {
+        c->set_output(0,
+                      c->MakeShape({c->Dim(query, 0), c->Dim(query, 1),
+                                    c->Dim(query, 2), c->Dim(key, 2)}));
+      } else {
+        c->set_output(0, c->Scalar());
+      }
       c->set_output(1, query);
       return Status::OK();
     });

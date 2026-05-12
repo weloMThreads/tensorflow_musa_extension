@@ -36,24 +36,28 @@ class MusaCausalAttentionGradOp : public MusaOpKernel {
                 errors::InvalidArgument("MusaCausalAttentionGrad expects float"));
     OP_REQUIRES(ctx, scale.NumElements() == 1,
                 errors::InvalidArgument("MusaCausalAttentionGrad expects scalar scale"));
-    OP_REQUIRES(ctx, softmax.dims() == 4 && dout.dims() == 4 &&
-                         query.dims() == 4 && key.dims() == 4 &&
-                         value.dims() == 4,
+    OP_REQUIRES(ctx, (softmax.dims() == 4 || softmax.dims() == 0) &&
+                         dout.dims() == 4 && query.dims() == 4 &&
+                         key.dims() == 4 && value.dims() == 4,
                 errors::InvalidArgument("MusaCausalAttentionGrad expects rank-4 tensors"));
 
-    const int64_t batch = softmax.dim_size(0);
-    const int64_t heads = softmax.dim_size(1);
-    const int64_t query_dim = softmax.dim_size(2);
-    const int64_t key_dim = softmax.dim_size(3);
+    const int64_t batch = query.dim_size(0);
+    const int64_t heads = query.dim_size(1);
+    const int64_t query_dim = query.dim_size(2);
+    const int64_t key_dim = key.dim_size(2);
     const int64_t value_dim = value.dim_size(3);
+    if (softmax.dims() == 4) {
+      OP_REQUIRES(ctx, softmax.dim_size(0) == batch &&
+                           softmax.dim_size(1) == heads &&
+                           softmax.dim_size(2) == query_dim &&
+                           softmax.dim_size(3) == key_dim,
+                  errors::InvalidArgument("MusaCausalAttentionGrad incompatible softmax shape"));
+    }
     OP_REQUIRES(ctx, dout.dim_size(0) == batch && dout.dim_size(1) == heads &&
                          dout.dim_size(2) == query_dim &&
                          dout.dim_size(3) == value_dim &&
-                         query.dim_size(0) == batch && query.dim_size(1) == heads &&
-                         query.dim_size(2) == query_dim &&
                          query.dim_size(3) == value_dim &&
                          key.dim_size(0) == batch && key.dim_size(1) == heads &&
-                         key.dim_size(2) == key_dim &&
                          key.dim_size(3) == value_dim &&
                          value.dim_size(0) == batch && value.dim_size(1) == heads &&
                          value.dim_size(2) == key_dim,
