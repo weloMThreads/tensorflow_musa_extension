@@ -1300,6 +1300,203 @@ bool IsReductionIndexMinusOne(const NodeDef* node) {
 }
 
 
+
+int OptimizeSimpleTensordotReshapeMatMul(GraphDef* graph) {
+  std::unordered_map<string, const NodeDef*> node_map;
+  node_map.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    node_map[node.name()] = &node;
+  }
+
+  std::unordered_map<string, std::vector<string>> consumers;
+  consumers.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    for (const auto& input : node.input()) {
+      if (!input.empty() && input[0] != '^') {
+        consumers[NodeNameFromInputLocal(input)].push_back(node.name());
+      }
+    }
+  }
+
+  auto find_node = [&](const string& input) -> const NodeDef* {
+    const auto it = node_map.find(NodeNameFromInputLocal(input));
+    return it == node_map.end() ? nullptr : it->second;
+  };
+  auto consumer_count = [&](const string& name) -> int {
+    const auto it = consumers.find(name);
+    return it == consumers.end() ? 0 : static_cast<int>(it->second.size());
+  };
+
+  std::unordered_set<string> remove_names;
+  int rewrites = 0;
+  const int original_node_size = graph->node_size();
+  for (int i = 0; i < original_node_size; ++i) {
+    NodeDef* output = graph->mutable_node(i);
+    if (output->op() != "Reshape" || output->input_size() != 2 ||
+        output->name().find("Tensordot") == string::npos) {
+      continue;
+    }
+
+    const NodeDef* matmul = find_node(output->input(0));
+    const NodeDef* reshape = matmul != nullptr && matmul->input_size() == 2
+                                 ? find_node(matmul->input(0))
+                                 : nullptr;
+    if (matmul == nullptr || matmul->op() != "MatMul" || reshape == nullptr ||
+        reshape->op() != "Reshape" || reshape->input_size() != 2) {
+      continue;
+    }
+    if (consumer_count(matmul->name()) != 1) {
+      continue;
+    }
+
+    bool transpose_a = false;
+    bool transpose_b = false;
+    const auto trans_a_it = matmul->attr().find("transpose_a");
+    if (trans_a_it != matmul->attr().end()) transpose_a = trans_a_it->second.b();
+    const auto trans_b_it = matmul->attr().find("transpose_b");
+    if (trans_b_it != matmul->attr().end()) transpose_b = trans_b_it->second.b();
+    if (transpose_a) {
+      continue;
+    }
+
+    DataType dtype = DT_FLOAT;
+    const auto t_it = matmul->attr().find("T");
+    if (t_it != matmul->attr().end()) dtype = t_it->second.type();
+
+    const string output_shape_name = NodeNameFromInputLocal(output->input(1));
+    const string reshape_shape_name = NodeNameFromInputLocal(reshape->input(1));
+    const string reshape_name = reshape->name();
+    const string matmul_name = matmul->name();
+
+    output->set_op("MusaReshapeMatMul");
+    output->clear_input();
+    output->add_input(reshape->input(0));
+    output->add_input(matmul->input(1));
+    output->mutable_attr()->clear();
+    (*output->mutable_attr())["T"].set_type(dtype);
+    (*output->mutable_attr())["transpose_b"].set_b(transpose_b);
+
+    remove_names.insert(matmul_name);
+    if (consumer_count(output_shape_name) == 1) {
+      remove_names.insert(output_shape_name);
+    }
+    if (consumer_count(reshape_name) == 1) {
+      remove_names.insert(reshape_name);
+      if (consumer_count(reshape_shape_name) == 1) {
+        remove_names.insert(reshape_shape_name);
+      }
+    }
+    rewrites++;
+  }
+
+  RemoveNodesByName(graph, remove_names);
+  if (rewrites > 0) {
+    LOG(INFO) << "MusaGraphOptimizer: Rewrote " << rewrites
+              << " Tensordot Reshape+MatMul node(s)";
+  }
+  return rewrites;
+}
+
+
+int OptimizeReshapeMatMulBiasAdd(GraphDef* graph) {
+  std::unordered_map<string, const NodeDef*> node_map;
+  node_map.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    node_map[node.name()] = &node;
+  }
+
+  std::unordered_map<string, std::vector<string>> consumers;
+  consumers.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    for (const auto& input : node.input()) {
+      if (!input.empty() && input[0] != '^') {
+        consumers[NodeNameFromInputLocal(input)].push_back(node.name());
+      }
+    }
+  }
+
+  auto find_node = [&](const string& input) -> const NodeDef* {
+    const auto it = node_map.find(NodeNameFromInputLocal(input));
+    return it == node_map.end() ? nullptr : it->second;
+  };
+  auto consumer_count = [&](const string& name) -> int {
+    const auto it = consumers.find(name);
+    return it == consumers.end() ? 0 : static_cast<int>(it->second.size());
+  };
+
+  std::unordered_set<string> remove_names;
+  int rewrites = 0;
+  const int original_node_size = graph->node_size();
+  for (int i = 0; i < original_node_size; ++i) {
+    NodeDef* bias_add = graph->mutable_node(i);
+    if (bias_add->op() != "BiasAdd" || bias_add->input_size() < 2) {
+      continue;
+    }
+
+    const auto data_format = bias_add->attr().find("data_format");
+    if (data_format != bias_add->attr().end() &&
+        data_format->second.s() != "NHWC") {
+      continue;
+    }
+
+    const NodeDef* matmul = find_node(bias_add->input(0));
+    if (matmul == nullptr || matmul->op() != "MusaReshapeMatMul" ||
+        matmul->input_size() < 2 || consumer_count(matmul->name()) != 1) {
+      continue;
+    }
+
+    DataType dtype = DT_FLOAT;
+    const auto t_it = matmul->attr().find("T");
+    if (t_it != matmul->attr().end()) dtype = t_it->second.type();
+
+    bool transpose_b = false;
+    const auto trans_b_it = matmul->attr().find("transpose_b");
+    if (trans_b_it != matmul->attr().end()) {
+      transpose_b = trans_b_it->second.b();
+    }
+
+    std::vector<string> control_inputs;
+    for (const auto& input : bias_add->input()) {
+      if (!input.empty() && input[0] == '^') control_inputs.push_back(input);
+    }
+    for (int j = 2; j < matmul->input_size(); ++j) {
+      const string& input = matmul->input(j);
+      if (!input.empty() && input[0] == '^') control_inputs.push_back(input);
+    }
+
+    const string x_input = matmul->input(0);
+    const string w_input = matmul->input(1);
+    const string bias_input = bias_add->input(1);
+
+    bias_add->set_op("MusaTensorDotBias");
+    bias_add->clear_input();
+    bias_add->add_input(x_input);
+    bias_add->add_input(w_input);
+    bias_add->add_input(bias_input);
+    for (const auto& input : control_inputs) {
+      bias_add->add_input(input);
+    }
+
+    bias_add->mutable_attr()->clear();
+    (*bias_add->mutable_attr())["T"].set_type(dtype);
+    auto* axes_a = (*bias_add->mutable_attr())["axes_a"].mutable_list();
+    axes_a->add_i(-1);
+    auto* axes_b = (*bias_add->mutable_attr())["axes_b"].mutable_list();
+    axes_b->add_i(transpose_b ? 1 : 0);
+
+    remove_names.insert(matmul->name());
+    rewrites++;
+  }
+
+  RemoveNodesByName(graph, remove_names);
+  if (rewrites > 0) {
+    LOG(INFO) << "MusaGraphOptimizer: Rewrote " << rewrites
+              << " ReshapeMatMul+BiasAdd node(s)";
+  }
+  return rewrites;
+}
+
+
 int OptimizeCausalMaskedSoftmax(GraphDef* graph) {
   std::unordered_map<string, const NodeDef*> node_map;
   node_map.reserve(graph->node_size());
@@ -2136,6 +2333,20 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
       dumper.DumpBeforePass(*optimized_graph, "fusion");
       TF_RETURN_IF_ERROR(OptimizeFusion(optimized_graph));
       dumper.DumpAfterPass(*optimized_graph, "fusion");
+    }
+
+    const int simple_tensordot_rewrites =
+        OptimizeSimpleTensordotReshapeMatMul(optimized_graph);
+    if (simple_tensordot_rewrites > 0) {
+      dumper.DumpAtStage(*optimized_graph,
+                         "after_simple_tensordot_reshape_matmul");
+    }
+
+    const int reshape_matmul_bias_rewrites =
+        OptimizeReshapeMatMulBiasAdd(optimized_graph);
+    if (reshape_matmul_bias_rewrites > 0) {
+      dumper.DumpAtStage(*optimized_graph,
+                         "after_reshape_matmul_biasadd_fusion");
     }
 
     const int forward_rmsnorm_rewrites =

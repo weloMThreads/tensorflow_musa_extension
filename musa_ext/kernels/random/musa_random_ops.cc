@@ -115,7 +115,7 @@ class MusaRandomUniformOp : public MusaOpKernel {
 
     const int block_size = 256;
     int num_blocks = static_cast<int>((n + block_size - 1) / block_size);
-    if (num_blocks > 1024) num_blocks = 1024;
+    if (num_blocks > 4096) num_blocks = 4096;
 
     void* stream = GetStream<T>(ctx);
     if (std::is_same<T, float>::value) {

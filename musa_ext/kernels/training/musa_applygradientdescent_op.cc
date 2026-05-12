@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <list>
+#include <stdint.h>
 #include <vector>
 
 #include "../array/musa_fill_functor.h"
@@ -38,6 +39,22 @@ extern Status CopyTensorForUpdate(OpKernelContext* ctx, const Tensor& src,
 
 extern Status PrepareTensorForMusaUpdate(OpKernelContext* ctx, Var* var);
 
+extern "C" void LaunchResourceApplyGradientDescentFloat(
+    float* var, const float* grad, float lr, int64_t n, musaStream_t stream);
+
+template <typename T>
+bool TryLaunchFastResourceApplyGradientDescent(OpKernelContext* ctx,
+                                               Tensor* var_t,
+                                               const Tensor& lr_t,
+                                               const Tensor& grad_t) {
+  return false;
+}
+
+template <>
+bool TryLaunchFastResourceApplyGradientDescent<float>(
+    OpKernelContext* ctx, Tensor* var_t, const Tensor& lr_t,
+    const Tensor& grad_t);
+
 class MutexUnlocker {
  public:
   explicit MutexUnlocker(mutex* mu) : mu_(mu) {}
@@ -50,6 +67,17 @@ class MutexUnlocker {
  private:
   mutex* mu_;
 };
+
+template <>
+bool TryLaunchFastResourceApplyGradientDescent<float>(
+    OpKernelContext* ctx, Tensor* var_t, const Tensor& lr_t,
+    const Tensor& grad_t) {
+  LaunchResourceApplyGradientDescentFloat(
+      var_t->flat<float>().data(), grad_t.flat<float>().data(),
+      lr_t.scalar<float>()(), static_cast<int64_t>(var_t->NumElements()),
+      GetMusaStreamByCtx(ctx));
+  return true;
+}
 
 // MUSA kernel for SGD update: var = var - lr * grad
 // Uses MuDNN operations for computation
@@ -91,6 +119,10 @@ class MusaResourceApplyGradientDescentOp : public MusaOpKernel {
                     var_t.shape().DebugString(),
                     " grad: ", grad_t.shape().DebugString()));
 
+    if (TryLaunchFastResourceApplyGradientDescent<T>(ctx, &var_t, lr_t, grad_t)) {
+      return;
+    }
+
     // Get MuDNN handle
     auto& handle = GetHandleByCtx(ctx);
     std::list<Tensor> temp_storage;
@@ -131,14 +163,6 @@ class MusaResourceApplyGradientDescentOp : public MusaOpKernel {
     // Compute: var = var - lr * grad
     b_op.SetMode(::musa::dnn::Binary::Mode::SUB);
     b_op.Run(handle, t_var, t_var, t_lr_grad);
-
-    // Synchronize to ensure computation is complete
-    musaStream_t stream = GetMusaStreamByCtx(ctx);
-    musaError_t sync_err = musaStreamSynchronize(stream);
-    OP_REQUIRES(ctx, sync_err == musaSuccess,
-                errors::Internal("ResourceApplyGradientDescent: "
-                                 "musaStreamSynchronize failed: ",
-                                 musaGetErrorString(sync_err)));
   }
 
  private:
