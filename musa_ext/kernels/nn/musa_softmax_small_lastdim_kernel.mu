@@ -247,7 +247,7 @@ extern "C" void LaunchMusaSmallLastDimSoftmaxFloat(const float* input,
   const dim3 block(kWarpSize, kRowsPerBlock, 1);
   const dim3 grid((outer_size + kRowsPerBlock - 1) / kRowsPerBlock, 1, 1);
   if (last_dim <= kWarpSize) {
-    constexpr int kRowsPerBlockLe32 = 16;
+    constexpr int kRowsPerBlockLe32 = 8;
     const dim3 block_le32(kWarpSize, kRowsPerBlockLe32, 1);
     const dim3 grid_le32((outer_size + kRowsPerBlockLe32 - 1) /
                          kRowsPerBlockLe32, 1, 1);
@@ -267,7 +267,7 @@ extern "C" void LaunchMusaSmallLastDimCausalMaskedSoftmaxFloat(
     return;
   }
   if (key_dim <= kWarpSize) {
-    constexpr int kRowsPerBlockLe32 = 16;
+    constexpr int kRowsPerBlockLe32 = 8;
     const dim3 block(kWarpSize, kRowsPerBlockLe32, 1);
     const int64_t outer_groups = outer_size / query_dim;
     const dim3 grid((query_dim + kRowsPerBlockLe32 - 1) /

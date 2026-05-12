@@ -2034,6 +2034,156 @@ bool IsReductionIndexMinusOne(const NodeDef* node) {
 }
 
 
+
+void AddConstInt32ScalarNode(GraphDef* graph, const string& name, int value,
+                             const string& device) {
+  NodeDef* node = graph->add_node();
+  node->set_name(name);
+  node->set_op("Const");
+  node->set_device(device);
+  (*node->mutable_attr())["dtype"].set_type(DT_INT32);
+  TensorProto* tensor = (*node->mutable_attr())["value"].mutable_tensor();
+  tensor->set_dtype(DT_INT32);
+  tensor->add_int_val(value);
+}
+
+NodeDef* AddTypedConcat3Node(GraphDef* graph, const string& name,
+                             const string& in0, const string& in1,
+                             const string& in2, const string& axis,
+                             DataType dtype, const string& device) {
+  NodeDef* node = graph->add_node();
+  node->set_name(name);
+  node->set_op("ConcatV2");
+  node->set_device(device);
+  node->add_input(in0);
+  node->add_input(in1);
+  node->add_input(in2);
+  node->add_input(axis);
+  (*node->mutable_attr())["N"].set_i(3);
+  (*node->mutable_attr())["T"].set_type(dtype);
+  (*node->mutable_attr())["Tidx"].set_type(DT_INT32);
+  return node;
+}
+
+bool IsQkvDenseDwMatMul(const NodeDef* node) {
+  if (node == nullptr || node->op() != "MatMul" || node->input_size() != 2 ||
+      node->name().find("gradient_tape/") == string::npos ||
+      node->name().find("pyramid_mixed_causal_attention") == string::npos ||
+      node->name().find("/dense_") == string::npos ||
+      !HasFloatTypeAttr(*node)) {
+    return false;
+  }
+  const auto transpose_a_it = node->attr().find("transpose_a");
+  const auto transpose_b_it = node->attr().find("transpose_b");
+  return transpose_a_it != node->attr().end() &&
+         transpose_a_it->second.b() &&
+         (transpose_b_it == node->attr().end() ||
+          !transpose_b_it->second.b());
+}
+
+int OptimizeQkvDenseDw(GraphDef* graph) {
+  std::unordered_map<string, const NodeDef*> node_map;
+  node_map.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    node_map[node.name()] = &node;
+  }
+
+  auto find_node = [&](const string& input) -> const NodeDef* {
+    const auto it = node_map.find(NodeNameFromInputLocal(input));
+    return it == node_map.end() ? nullptr : it->second;
+  };
+
+  std::unordered_map<string, std::vector<const NodeDef*>> groups;
+  const int original_node_size = graph->node_size();
+  for (int i = 0; i < original_node_size; ++i) {
+    const NodeDef& node = graph->node(i);
+    if (!IsQkvDenseDwMatMul(&node)) continue;
+    const NodeDef* x_reshape = find_node(node.input(0));
+    if (x_reshape == nullptr || x_reshape->op() != "Reshape" ||
+        x_reshape->input_size() < 1) {
+      continue;
+    }
+    groups[NodeNameFromInputLocal(x_reshape->input(0))].push_back(&node);
+  }
+
+  std::unordered_set<string> remove_names;
+  int rewrites = 0;
+  for (auto& item : groups) {
+    std::vector<const NodeDef*>& nodes = item.second;
+    if (nodes.size() != 3) continue;
+    std::sort(nodes.begin(), nodes.end(),
+              [](const NodeDef* lhs, const NodeDef* rhs) {
+                return lhs->name() < rhs->name();
+              });
+
+    const NodeDef* x0 = find_node(nodes[0]->input(0));
+    const NodeDef* x1 = find_node(nodes[1]->input(0));
+    const NodeDef* x2 = find_node(nodes[2]->input(0));
+    const DataType dtype = GetNodeTypeAttr(*nodes[0]);
+    if (x0 == nullptr || x1 == nullptr || x2 == nullptr ||
+        GetNodeTypeAttr(*nodes[1]) != dtype ||
+        GetNodeTypeAttr(*nodes[2]) != dtype ||
+        NodeNameFromInputLocal(x0->input(0)) !=
+            NodeNameFromInputLocal(x1->input(0)) ||
+        NodeNameFromInputLocal(x0->input(0)) !=
+            NodeNameFromInputLocal(x2->input(0))) {
+      continue;
+    }
+
+    const string axis_name = nodes[0]->name() + "/musa_qkv_dense_dw_axis";
+    const string dy_concat_name =
+        nodes[0]->name() + "/musa_qkv_dense_dw_dy_concat";
+    const string fused_name = nodes[0]->name() + "/musa_qkv_dense_dw_matmul";
+    const string split_name = fused_name + "/split";
+    if (node_map.find(axis_name) != node_map.end() ||
+        node_map.find(dy_concat_name) != node_map.end() ||
+        node_map.find(fused_name) != node_map.end() ||
+        node_map.find(split_name) != node_map.end()) {
+      continue;
+    }
+
+    AddConstInt32ScalarNode(graph, axis_name, 1, nodes[0]->device());
+    AddTypedConcat3Node(graph, dy_concat_name, nodes[0]->input(1),
+                        nodes[1]->input(1), nodes[2]->input(1), axis_name,
+                        dtype, nodes[0]->device());
+
+    NodeDef* fused = graph->add_node();
+    fused->set_name(fused_name);
+    fused->set_op("MatMul");
+    fused->set_device(nodes[0]->device());
+    fused->add_input(nodes[0]->input(0));
+    fused->add_input(dy_concat_name);
+    (*fused->mutable_attr())["T"].set_type(dtype);
+    (*fused->mutable_attr())["transpose_a"].set_b(true);
+    (*fused->mutable_attr())["transpose_b"].set_b(false);
+
+    NodeDef* split = graph->add_node();
+    split->set_name(split_name);
+    split->set_op("Split");
+    split->set_device(nodes[0]->device());
+    split->add_input(axis_name);
+    split->add_input(fused_name);
+    (*split->mutable_attr())["num_split"].set_i(3);
+    (*split->mutable_attr())["T"].set_type(dtype);
+
+    for (int part = 0; part < 3; ++part) {
+      RedirectDataConsumersToInput(graph, nodes[part]->name(),
+                                   split_name + ":" + std::to_string(part),
+                                   split_name);
+      remove_names.insert(nodes[part]->name());
+    }
+    rewrites++;
+  }
+
+  RemoveNodesByName(graph, remove_names);
+  if (rewrites > 0) {
+    LOG(INFO) << "MusaGraphOptimizer: Rewrote " << rewrites
+              << " QKV dense dW group(s) to concat MatMul+Split";
+  }
+  return rewrites;
+}
+
+
 int OptimizeCausalMaskedSoftmax(GraphDef* graph) {
   std::unordered_map<string, const NodeDef*> node_map;
   node_map.reserve(graph->node_size());
@@ -2162,6 +2312,106 @@ int OptimizeCausalMaskedSoftmax(GraphDef* graph) {
   return rewrites;
 }
 
+int OptimizeCausalAttentionForward(GraphDef* graph) {
+  std::unordered_map<string, const NodeDef*> node_map;
+  node_map.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    node_map[node.name()] = &node;
+  }
+
+  std::unordered_map<string, std::vector<string>> consumers;
+  consumers.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    for (const auto& input : node.input()) {
+      if (!input.empty() && input[0] != '^') {
+        consumers[NodeNameFromInputLocal(input)].push_back(node.name());
+      }
+    }
+  }
+
+  auto find_node = [&](const string& input) -> const NodeDef* {
+    const auto it = node_map.find(NodeNameFromInputLocal(input));
+    return it == node_map.end() ? nullptr : it->second;
+  };
+  auto bool_attr = [](const NodeDef& node, const char* name) -> bool {
+    const auto it = node.attr().find(name);
+    return it != node.attr().end() && it->second.b();
+  };
+
+  std::unordered_set<string> remove_names;
+  int rewrites = 0;
+  const int original_node_size = graph->node_size();
+  for (int i = 0; i < original_node_size; ++i) {
+    NodeDef* softmax = graph->mutable_node(i);
+    if (softmax->op() != "MusaCausalMaskedSoftmax" ||
+        softmax->input_size() != 2 ||
+        softmax->name().find("pyramid_mixed_causal_attention") ==
+            string::npos) {
+      continue;
+    }
+    const NodeDef* qk_bmm = find_node(softmax->input(0));
+    if (qk_bmm == nullptr || qk_bmm->op() != "BatchMatMulV2" ||
+        qk_bmm->input_size() != 2 || !HasFloatTypeAttr(*qk_bmm) ||
+        bool_attr(*qk_bmm, "adj_x") || !bool_attr(*qk_bmm, "adj_y") ||
+        !IsOnlyConsumer(consumers, qk_bmm->name(), softmax->name())) {
+      continue;
+    }
+    const DataType dtype = GetNodeTypeAttr(*qk_bmm);
+
+    const NodeDef* value_bmm = nullptr;
+    const auto softmax_consumers = consumers.find(softmax->name());
+    if (softmax_consumers == consumers.end()) continue;
+    for (const string& consumer_name : softmax_consumers->second) {
+      const NodeDef* candidate = find_node(consumer_name);
+      if (candidate == nullptr || candidate->op() != "BatchMatMulV2" ||
+          candidate->input_size() != 2 || !HasFloatTypeAttr(*candidate) ||
+          GetNodeTypeAttr(*candidate) != dtype ||
+          candidate->name().find("gradient_tape/") != string::npos) {
+        continue;
+      }
+      if (NodeNameFromInputLocal(candidate->input(0)) == softmax->name() &&
+          !bool_attr(*candidate, "adj_x") && !bool_attr(*candidate, "adj_y")) {
+        value_bmm = candidate;
+        break;
+      }
+    }
+    if (value_bmm == nullptr) continue;
+    const NodeDef* value = find_node(value_bmm->input(1));
+    if (value == nullptr || value->op() != "Transpose" ||
+        !HasFloatTypeAttr(*value) || GetNodeTypeAttr(*value) != dtype) {
+      continue;
+    }
+
+    const string query_input = qk_bmm->input(0);
+    const string key_input = qk_bmm->input(1);
+    const string value_input = value_bmm->input(1);
+    const string scale_input = softmax->input(1);
+
+    RedirectDataConsumersToInput(graph, value_bmm->name(), softmax->name() + ":1",
+                                 softmax->name());
+
+    softmax->set_op("MusaCausalAttentionForward");
+    softmax->clear_input();
+    softmax->add_input(query_input);
+    softmax->add_input(key_input);
+    softmax->add_input(value_input);
+    softmax->add_input(scale_input);
+    softmax->mutable_attr()->clear();
+    (*softmax->mutable_attr())["T"].set_type(dtype);
+
+    remove_names.insert(qk_bmm->name());
+    remove_names.insert(value_bmm->name());
+    rewrites++;
+  }
+
+  RemoveNodesByName(graph, remove_names);
+  if (rewrites > 0) {
+    LOG(INFO) << "MusaGraphOptimizer: Rewrote " << rewrites
+              << " causal attention forward core group(s)";
+  }
+  return rewrites;
+}
+
 int OptimizeSoftmaxGradSmallLastDim(GraphDef* graph) {
   std::unordered_map<string, const NodeDef*> node_map;
   node_map.reserve(graph->node_size());
@@ -2204,7 +2454,8 @@ int OptimizeSoftmaxGradSmallLastDim(GraphDef* graph) {
       if (candidate->op() == "Sub") {
         sub = candidate;
       } else if (candidate->op() == "Softmax" ||
-                 candidate->op() == "MusaCausalMaskedSoftmax") {
+                 candidate->op() == "MusaCausalMaskedSoftmax" ||
+                 candidate->op() == "MusaCausalAttentionForward") {
         softmax = candidate;
       }
     }
@@ -2273,6 +2524,149 @@ int OptimizeSoftmaxGradSmallLastDim(GraphDef* graph) {
   if (rewrites > 0) {
     LOG(INFO) << "MusaGraphOptimizer: Rewrote " << rewrites
               << " softmax grad node(s) with MusaSoftmaxGrad";
+  }
+  return rewrites;
+}
+
+int OptimizeCausalAttentionGrad(GraphDef* graph) {
+  std::unordered_map<string, const NodeDef*> node_map;
+  node_map.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    node_map[node.name()] = &node;
+  }
+
+  auto find_node = [&](const string& input) -> const NodeDef* {
+    const auto it = node_map.find(NodeNameFromInputLocal(input));
+    return it == node_map.end() ? nullptr : it->second;
+  };
+
+  auto get_bool_attr = [](const NodeDef& node, const char* name) -> bool {
+    const auto it = node.attr().find(name);
+    return it != node.attr().end() && it->second.b();
+  };
+
+  std::unordered_set<string> remove_names;
+  int rewrites = 0;
+  const int original_node_size = graph->node_size();
+  for (int i = 0; i < original_node_size; ++i) {
+    const NodeDef& softmax_grad = graph->node(i);
+    if (softmax_grad.op() != "MusaSoftmaxGrad" ||
+        softmax_grad.input_size() != 2 ||
+        softmax_grad.name().find("pyramid_mixed_causal_attention") ==
+            string::npos) {
+      continue;
+    }
+    const DataType dtype = GetNodeTypeAttr(softmax_grad);
+    if (!IsFloatOrBFloat16Type(dtype)) continue;
+
+    const NodeDef* softmax = find_node(softmax_grad.input(0));
+    const NodeDef* ds_bmm = find_node(softmax_grad.input(1));
+    const bool softmax_is_causal =
+        softmax != nullptr &&
+        ((softmax->op() == "MusaCausalMaskedSoftmax" &&
+          softmax->input_size() == 2) ||
+         (softmax->op() == "MusaCausalAttentionForward" &&
+          softmax->input_size() == 4));
+    if (softmax_is_causal && GetNodeTypeAttr(*softmax) != dtype) continue;
+    if (!softmax_is_causal || ds_bmm == nullptr || ds_bmm->op() != "BatchMatMulV2" ||
+        ds_bmm->input_size() != 2 ||
+        !HasFloatTypeAttr(*ds_bmm) || GetNodeTypeAttr(*ds_bmm) != dtype ||
+        get_bool_attr(*ds_bmm, "adj_x") ||
+        !get_bool_attr(*ds_bmm, "adj_y")) {
+      continue;
+    }
+    const string dout_input = ds_bmm->input(0);
+    const string value_input = ds_bmm->input(1);
+
+    const NodeDef* scale_mul = nullptr;
+    const NodeDef* dq_bmm = nullptr;
+    const NodeDef* dk_bmm = nullptr;
+    const NodeDef* dv_bmm = nullptr;
+    string query_input;
+    string key_input;
+    for (const auto& candidate : graph->node()) {
+      if (candidate.op() == "Mul" && candidate.input_size() == 2 &&
+          !remove_names.count(candidate.name())) {
+        const string in0 = NodeNameFromInputLocal(candidate.input(0));
+        const string in1 = NodeNameFromInputLocal(candidate.input(1));
+        if (in0 == softmax_grad.name() || in1 == softmax_grad.name()) {
+          scale_mul = &candidate;
+        }
+      }
+      if (candidate.op() != "BatchMatMulV2" || candidate.input_size() != 2 ||
+          !HasFloatTypeAttr(candidate) || GetNodeTypeAttr(candidate) != dtype) {
+        continue;
+      }
+      const string in0 = NodeNameFromInputLocal(candidate.input(0));
+      const string in1 = NodeNameFromInputLocal(candidate.input(1));
+      if (in0 == softmax->name() &&
+          in1 == NodeNameFromInputLocal(dout_input) &&
+          get_bool_attr(candidate, "adj_x") &&
+          !get_bool_attr(candidate, "adj_y")) {
+        dv_bmm = &candidate;
+      }
+    }
+    if (scale_mul == nullptr || dv_bmm == nullptr) continue;
+
+    for (const auto& candidate : graph->node()) {
+      if (candidate.op() != "BatchMatMulV2" || candidate.input_size() != 2 ||
+          !HasFloatTypeAttr(candidate) || GetNodeTypeAttr(candidate) != dtype) {
+        continue;
+      }
+      const string in0 = NodeNameFromInputLocal(candidate.input(0));
+      if (in0 != scale_mul->name()) continue;
+      if (!get_bool_attr(candidate, "adj_x") &&
+          !get_bool_attr(candidate, "adj_y")) {
+        dq_bmm = &candidate;
+        key_input = candidate.input(1);
+      } else if (get_bool_attr(candidate, "adj_x") &&
+                 !get_bool_attr(candidate, "adj_y")) {
+        dk_bmm = &candidate;
+        query_input = candidate.input(1);
+      }
+    }
+    if (dq_bmm == nullptr || dk_bmm == nullptr || query_input.empty() ||
+        key_input.empty()) {
+      continue;
+    }
+
+    const string fused_name = softmax_grad.name() + "/musa_causal_attention_grad";
+    if (node_map.find(fused_name) != node_map.end()) continue;
+    const string scale_input =
+        softmax->op() == "MusaCausalAttentionForward" ? softmax->input(3)
+                                                       : softmax->input(1);
+
+    NodeDef* fused = graph->add_node();
+    fused->set_name(fused_name);
+    fused->set_op("MusaCausalAttentionGrad");
+    fused->set_device(softmax_grad.device());
+    fused->add_input(softmax->name());
+    fused->add_input(dout_input);
+    fused->add_input(query_input);
+    fused->add_input(key_input);
+    fused->add_input(value_input);
+    fused->add_input(scale_input);
+    (*fused->mutable_attr())["T"].set_type(dtype);
+
+    RedirectDataConsumersToInput(graph, dq_bmm->name(), fused_name, fused_name);
+    RedirectDataConsumersToInput(graph, dk_bmm->name(), fused_name + ":1",
+                                 fused_name);
+    RedirectDataConsumersToInput(graph, dv_bmm->name(), fused_name + ":2",
+                                 fused_name);
+
+    remove_names.insert(ds_bmm->name());
+    remove_names.insert(softmax_grad.name());
+    remove_names.insert(scale_mul->name());
+    remove_names.insert(dq_bmm->name());
+    remove_names.insert(dk_bmm->name());
+    remove_names.insert(dv_bmm->name());
+    rewrites++;
+  }
+
+  RemoveNodesByName(graph, remove_names);
+  if (rewrites > 0) {
+    LOG(INFO) << "MusaGraphOptimizer: Rewrote " << rewrites
+              << " causal attention grad group(s)";
   }
   return rewrites;
 }
@@ -2932,6 +3326,15 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
       dumper.DumpAfterPass(*optimized_graph, "fusion");
     }
 
+    if (!EnvFlagEnabledLocal("MUSA_DISABLE_QKV_DENSE_DW_FUSION")) {
+      const int qkv_dense_dw_rewrites =
+          OptimizeQkvDenseDw(optimized_graph);
+      if (qkv_dense_dw_rewrites > 0) {
+        dumper.DumpAtStage(*optimized_graph,
+                           "after_qkv_dense_dw_fusion");
+      }
+    }
+
     if (!EnvFlagEnabledLocal("MUSA_DISABLE_FORWARD_RMSNORM_FUSION")) {
       const int forward_rmsnorm_rewrites =
           OptimizeForwardRmsNorm(optimized_graph);
@@ -2990,12 +3393,30 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
       }
     }
 
+    if (!EnvFlagEnabledLocal("MUSA_DISABLE_CAUSAL_ATTENTION_FORWARD_FUSION")) {
+      const int causal_attention_forward_rewrites =
+          OptimizeCausalAttentionForward(optimized_graph);
+      if (causal_attention_forward_rewrites > 0) {
+        dumper.DumpAtStage(*optimized_graph,
+                           "after_causal_attention_forward_fusion");
+      }
+    }
+
     if (!EnvFlagEnabledLocal("MUSA_DISABLE_SOFTMAX_GRAD_FUSION")) {
       const int softmax_grad_rewrites =
           OptimizeSoftmaxGradSmallLastDim(optimized_graph);
       if (softmax_grad_rewrites > 0) {
         dumper.DumpAtStage(*optimized_graph,
                            "after_softmax_grad_fusion");
+      }
+    }
+
+    if (!EnvFlagEnabledLocal("MUSA_DISABLE_CAUSAL_ATTENTION_GRAD_FUSION")) {
+      const int causal_attention_grad_rewrites =
+          OptimizeCausalAttentionGrad(optimized_graph);
+      if (causal_attention_grad_rewrites > 0) {
+        dumper.DumpAtStage(*optimized_graph,
+                           "after_causal_attention_grad_fusion");
       }
     }
 
