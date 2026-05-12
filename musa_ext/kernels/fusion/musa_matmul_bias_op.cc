@@ -144,7 +144,7 @@ class MusaMatMulBiasAddOp : public MusaOpKernel {
     }
 
     *out_shape = TensorShape({m, n});
-    return Status::OK();
+    return ::tensorflow::OkStatus();
   }
 
  private:

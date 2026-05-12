@@ -70,7 +70,7 @@ REGISTER_OP("MusaSoftmaxGrad")
     .Output("dx: float")
     .SetShapeFn([](::tensorflow::shape_inference::InferenceContext* c) {
       c->set_output(0, c->input(0));
-      return Status::OK();
+      return ::tensorflow::OkStatus();
     });
 
 }  // namespace tensorflow

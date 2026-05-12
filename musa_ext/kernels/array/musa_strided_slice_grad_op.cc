@@ -73,7 +73,7 @@ Status ShapeTensorToTensorShape(const Tensor& shape_tensor,
     }
     output_shape->AddDim(dim);
   }
-  return Status::OK();
+  return ::tensorflow::OkStatus();
 }
 
 inline void FillLaunchParams(const TensorShape& output_shape,

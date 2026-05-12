@@ -17,6 +17,7 @@ limitations under the License.
 #define TENSORFLOW_MUSA_EXTENSION_GRAPH_UTILS_H_
 
 #include <string>
+#include "tensorflow/core/lib/core/errors.h"
 
 #include "tensorflow/core/framework/graph.pb.h"
 #include "tensorflow/core/lib/core/status.h"

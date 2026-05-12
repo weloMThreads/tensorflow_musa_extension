@@ -1,11 +1,12 @@
 #include <musa_runtime.h>
 
 #include "musa_executor.h"
-#include "tensorflow/stream_executor/executor_cache.h"
-#include "tensorflow/stream_executor/lib/error.h"
-#include "tensorflow/stream_executor/multi_platform_manager.h"
-#include "tensorflow/stream_executor/platform.h"
-#include "tensorflow/stream_executor/stream_executor_internal.h"
+#include "xla/stream_executor/executor_cache.h"
+#include "tsl/platform/errors.h"
+#include "tsl/platform/statusor.h"
+#include "xla/stream_executor/multi_platform_manager.h"
+#include "xla/stream_executor/platform.h"
+#include "xla/stream_executor/stream_executor_internal.h"
 
 namespace stream_executor {
 namespace musa {
@@ -26,7 +27,7 @@ class MusaPlatform : public Platform {
     return count;
   }
 
-  port::StatusOr<std::unique_ptr<DeviceDescription>> DescriptionForDevice(
+  tsl::StatusOr<std::unique_ptr<DeviceDescription>> DescriptionForDevice(
       int ordinal) const override {
     internal::DeviceDescriptionBuilder builder;
     builder.set_name("MUSA Device");
@@ -34,42 +35,29 @@ class MusaPlatform : public Platform {
     return builder.Build();
   }
 
-  port::StatusOr<StreamExecutor*> ExecutorForDevice(int ordinal) override {
+  tsl::StatusOr<StreamExecutor*> ExecutorForDevice(int ordinal) override {
     StreamExecutorConfig config;
     config.ordinal = ordinal;
     config.device_options = DeviceOptions::Default();
     return GetExecutor(config);
   }
 
-  port::StatusOr<StreamExecutor*> ExecutorForDeviceWithPluginConfig(
-      int ordinal, const PluginConfig& plugin_config) override {
-    StreamExecutorConfig config;
-    config.ordinal = ordinal;
-    config.plugin_config = plugin_config;
-    config.device_options = DeviceOptions::Default();
-    return GetExecutor(config);
-  }
 
-  port::StatusOr<StreamExecutor*> GetExecutor(
+  tsl::StatusOr<StreamExecutor*> GetExecutor(
       const StreamExecutorConfig& config) override {
     return executor_cache_.GetOrCreate(
         config, [&]() { return GetUncachedExecutor(config); });
   }
 
-  void RegisterTraceListener(std::unique_ptr<TraceListener> listener) override {
-  }
-  void UnregisterTraceListener(TraceListener* listener) override {}
 
  private:
-  port::StatusOr<std::unique_ptr<StreamExecutor>> GetUncachedExecutor(
+  tsl::StatusOr<std::unique_ptr<StreamExecutor>> GetUncachedExecutor(
       const StreamExecutorConfig& config) {
-    auto executor = std::make_unique<MusaExecutor>(config.plugin_config);
+    auto executor = std::make_unique<MusaExecutor>();
 
     auto init_status = executor->Init(config.ordinal, config.device_options);
     if (!init_status.ok()) {
-      return port::Status(
-          port::error::INTERNAL,
-          "Failed to initialize MUSA executor: " + init_status.ToString());
+      return tsl::errors::Internal("Failed to initialize MUSA executor: " + init_status.ToString());
     }
 
     return std::make_unique<StreamExecutor>(this, std::move(executor),

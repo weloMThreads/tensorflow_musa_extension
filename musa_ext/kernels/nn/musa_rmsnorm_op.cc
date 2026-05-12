@@ -133,7 +133,7 @@ REGISTER_OP("MusaRmsNormGradDx")
     .Attr("T: {float}")
     .SetShapeFn([](::tensorflow::shape_inference::InferenceContext* c) {
       c->set_output(0, c->input(0));
-      return Status::OK();
+      return ::tensorflow::OkStatus();
     });
 
 REGISTER_OP("MusaRmsNorm")
@@ -150,7 +150,7 @@ REGISTER_OP("MusaRmsNorm")
       c->set_output(1, x);
       if (!c->RankKnown(x)) {
         c->set_output(2, c->UnknownShape());
-        return Status::OK();
+        return ::tensorflow::OkStatus();
       }
       std::vector<::tensorflow::shape_inference::DimensionHandle> dims;
       const int rank = c->Rank(x);
@@ -160,7 +160,7 @@ REGISTER_OP("MusaRmsNorm")
       }
       dims.push_back(c->MakeDim(1));
       c->set_output(2, c->MakeShape(dims));
-      return Status::OK();
+      return ::tensorflow::OkStatus();
     });
 
 }  // namespace tensorflow

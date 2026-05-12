@@ -60,7 +60,7 @@ struct EinsumHelper {
           " but got dimension ", input_dim);
     }
     (*label_to_dim_sizes)[label] = input_dim;
-    return Status::OK();
+    return ::tensorflow::OkStatus();
   }
 
   // Validate input dimensions and populate unnamed labels and their label
@@ -130,7 +130,7 @@ struct EinsumHelper {
     }
     if (!absl::c_linear_search(input_has_ellipsis, true) &&
         !output_has_ellipsis) {
-      return Status::OK();
+      return ::tensorflow::OkStatus();
     }
     // Insert broadcasting dimensions in the output labels.
     auto it =
@@ -148,7 +148,7 @@ struct EinsumHelper {
     // Populate EinsumDimensionType for the new broadcasting labels.
     label_types->resize(num_named_labels + max_bcast_dims,
                         EinsumDimensionType::kBroadcasting);
-    return Status::OK();
+    return ::tensorflow::OkStatus();
   }
 
   // Permutes the labels according to the given permutation.
@@ -164,7 +164,7 @@ struct EinsumHelper {
   // Returns a reshaped input Tensor. The underlying buffer is not copied.
   static Status CopyFrom(const Tensor& input, const TensorShape& shape,
                          Tensor* output) {
-    if (output->CopyFrom(input, shape)) return Status::OK();
+    if (output->CopyFrom(input, shape)) return ::tensorflow::OkStatus();
     return errors::Internal(
         "Encountered error while reshaping a Tensor of shape ",
         input.shape().DebugString(), " to shape ", shape.DebugString());
@@ -188,7 +188,7 @@ struct EinsumHelper {
     }
 
     TF_RETURN_IF_ERROR(ctx->allocate_temp(dst_dtype, input.shape(), output));
-    if (input.NumElements() == 0) return Status::OK();
+    if (input.NumElements() == 0) return ::tensorflow::OkStatus();
 
     auto input_mt = CreateMTensor(input);
     auto output_mt = CreateMTensor(*output);
@@ -271,7 +271,7 @@ struct EinsumHelper {
         ctx->allocate_temp(DataTypeToEnum<T>::value, output_shape, output));
 
     const int rank = reshape.size();
-    if (rank == 0) return Status::OK();
+    if (rank == 0) return ::tensorflow::OkStatus();
 
     auto compute_dense_strides = [](const ShapeVec& dims) {
       ShapeVec dense_strides(dims.size(), 1);
@@ -324,7 +324,7 @@ struct EinsumHelper {
       return errors::Internal("Einsum StrideOrInflate Run failed. Status: ",
                               static_cast<int>(status));
     }
-    return Status::OK();
+    return ::tensorflow::OkStatus();
   }
 
   // Returns true if the input dimensions are already sorted in the order
@@ -365,7 +365,7 @@ struct EinsumHelper {
     int64 n = trans_b ? d2 : d3;
     int64 k_check = trans_b ? d3 : d2;
 
-    if (output->NumElements() == 0) return Status::OK();
+    if (output->NumElements() == 0) return ::tensorflow::OkStatus();
 
     static bool tf32_enabled_global = []() {
       const char* tf32_env = std::getenv("MUSA_ENABLE_TF32");
@@ -406,7 +406,7 @@ struct EinsumHelper {
                               (int)status);
     }
 
-    return Status::OK();
+    return ::tensorflow::OkStatus();
   }
 
   template <typename T>
@@ -550,7 +550,7 @@ struct EinsumHelper {
 
     TF_RETURN_IF_ERROR(
         ctx->allocate_temp(DataTypeToEnum<T>::value, output_shape, output));
-    if (output->NumElements() == 0) return Status::OK();
+    if (output->NumElements() == 0) return ::tensorflow::OkStatus();
 
     std::vector<int64_t> input_dense_strides(input_rank, 1);
     for (int axis = input_rank - 2; axis >= 0; --axis) {
@@ -612,7 +612,7 @@ struct EinsumHelper {
           "Einsum batch broadcast: Unary Run failed. Status: ",
           static_cast<int>(status));
     }
-    return Status::OK();
+    return ::tensorflow::OkStatus();
   }
 
   // Contracts the inputs along the last axis (or the second last if the
@@ -662,7 +662,7 @@ struct EinsumHelper {
     if (lhs.NumElements() == 0 || rhs.NumElements() == 0) {
       mTensor output_mt = CreateMTensor(*output);
       TF_RETURN_IF_ERROR(SetZeroFunctor::Compute<T>(ctx, &output_mt));
-      return Status::OK();
+      return ::tensorflow::OkStatus();
     }
     Tensor output_reshaped;
     TF_RETURN_IF_ERROR(

@@ -682,6 +682,11 @@ bool GetConstScalarFloat(const NodeDef* node, float* value) {
   return true;
 }
 
+bool IsFloatZeroConst(const NodeDef* node) {
+  float value = 0.0f;
+  return GetConstScalarFloat(node, &value) && value == 0.0f;
+}
+
 bool IsOnlyConsumer(const std::unordered_map<string, std::vector<string>>& consumers,
                     const string& producer, const string& consumer) {
   const auto it = consumers.find(producer);
@@ -1066,6 +1071,447 @@ int OptimizeRmsNormGradDxWarp128(GraphDef* graph) {
 }
 
 
+
+bool IsReadVariableFromResource(
+    const NodeDef* node, const string& resource_input) {
+  return node != nullptr && node->op() == "ReadVariableOp" &&
+         node->input_size() >= 1 &&
+         NodeNameFromInputLocal(node->input(0)) ==
+             NodeNameFromInputLocal(resource_input);
+}
+
+bool ExtractTf215SgdZeroSlotMul(
+    const NodeDef* mul, const string& slot_resource,
+    const std::unordered_map<string, const NodeDef*>& node_map,
+    std::vector<string>* remove_names) {
+  if (mul == nullptr || mul->op() != "Mul" || mul->input_size() != 2 ||
+      !HasFloatTypeAttr(*mul)) {
+    return false;
+  }
+
+  auto find_node = [&](const string& input) -> const NodeDef* {
+    const auto it = node_map.find(NodeNameFromInputLocal(input));
+    return it == node_map.end() ? nullptr : it->second;
+  };
+
+  for (int read_idx = 0; read_idx < 2; ++read_idx) {
+    const int zero_idx = 1 - read_idx;
+    const NodeDef* read = find_node(mul->input(read_idx));
+    const NodeDef* zero = find_node(mul->input(zero_idx));
+    if (IsReadVariableFromResource(read, slot_resource) &&
+        IsFloatZeroConst(zero)) {
+      remove_names->push_back(mul->name());
+      remove_names->push_back(read->name());
+      return true;
+    }
+  }
+  return false;
+}
+
+bool ExtractTf215SgdNegGradLrMul(
+    const NodeDef* mul,
+    const std::unordered_map<string, const NodeDef*>& node_map,
+    string* grad_input, string* lr_input,
+    std::vector<string>* remove_names) {
+  if (mul == nullptr || mul->op() != "Mul" || mul->input_size() != 2 ||
+      !HasFloatTypeAttr(*mul)) {
+    return false;
+  }
+
+  auto find_node = [&](const string& input) -> const NodeDef* {
+    const auto it = node_map.find(NodeNameFromInputLocal(input));
+    return it == node_map.end() ? nullptr : it->second;
+  };
+
+  for (int neg_idx = 0; neg_idx < 2; ++neg_idx) {
+    const int lr_idx = 1 - neg_idx;
+    const NodeDef* neg = find_node(mul->input(neg_idx));
+    const NodeDef* lr = find_node(mul->input(lr_idx));
+    if (neg != nullptr && neg->op() == "Neg" && neg->input_size() == 1 &&
+        HasFloatTypeAttr(*neg) && lr != nullptr &&
+        lr->op() == "ReadVariableOp") {
+      *grad_input = neg->input(0);
+      *lr_input = mul->input(lr_idx);
+      remove_names->push_back(mul->name());
+      remove_names->push_back(neg->name());
+      return true;
+    }
+  }
+  return false;
+}
+
+int OptimizeTf215SgdAssignAdd(GraphDef* graph) {
+  std::unordered_map<string, const NodeDef*> node_map;
+  node_map.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    node_map[node.name()] = &node;
+  }
+
+  auto find_node = [&](const string& input) -> const NodeDef* {
+    const auto it = node_map.find(NodeNameFromInputLocal(input));
+    return it == node_map.end() ? nullptr : it->second;
+  };
+
+  std::unordered_set<string> remove_names;
+  int rewrites = 0;
+  const int original_node_size = graph->node_size();
+  for (int i = 0; i < original_node_size; ++i) {
+    const NodeDef& assign_add = graph->node(i);
+    if (assign_add.op() != "AssignAddVariableOp" ||
+        assign_add.input_size() < 2 ||
+        assign_add.name().find("SGD/") != 0) {
+      continue;
+    }
+    const auto dtype_it = assign_add.attr().find("dtype");
+    if (dtype_it == assign_add.attr().end() ||
+        dtype_it->second.type() != DT_FLOAT) {
+      continue;
+    }
+
+    const NodeDef* slot_read = find_node(assign_add.input(1));
+    if (slot_read == nullptr || slot_read->op() != "ReadVariableOp" ||
+        slot_read->input_size() < 2) {
+      continue;
+    }
+
+    const string slot_resource = slot_read->input(0);
+    const NodeDef* slot_assign = nullptr;
+    for (int input_idx = 1; input_idx < slot_read->input_size(); ++input_idx) {
+      const string& ctrl = slot_read->input(input_idx);
+      if (ctrl.empty() || ctrl[0] != '^') continue;
+      const NodeDef* ctrl_node = find_node(ctrl);
+      if (ctrl_node != nullptr && ctrl_node->op() == "AssignVariableOp" &&
+          ctrl_node->input_size() >= 2 &&
+          NodeNameFromInputLocal(ctrl_node->input(0)) ==
+              NodeNameFromInputLocal(slot_resource)) {
+        slot_assign = ctrl_node;
+        break;
+      }
+    }
+    if (slot_assign == nullptr) continue;
+
+    const NodeDef* add = find_node(slot_assign->input(1));
+    if (add == nullptr || add->op() != "AddV2" || add->input_size() != 2 ||
+        !HasFloatTypeAttr(*add)) {
+      continue;
+    }
+
+    string grad_input;
+    string lr_input;
+    std::vector<string> local_remove;
+    bool matched = false;
+    for (int update_idx = 0; update_idx < 2; ++update_idx) {
+      const int zero_idx = 1 - update_idx;
+      std::vector<string> update_remove;
+      string candidate_grad;
+      string candidate_lr;
+      if (ExtractTf215SgdNegGradLrMul(
+              find_node(add->input(update_idx)), node_map, &candidate_grad,
+              &candidate_lr, &update_remove) &&
+          ExtractTf215SgdZeroSlotMul(find_node(add->input(zero_idx)),
+                                     slot_resource, node_map,
+                                     &update_remove)) {
+        grad_input = candidate_grad;
+        lr_input = candidate_lr;
+        local_remove = std::move(update_remove);
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) continue;
+
+    const string fused_name =
+        assign_add.name() + "/musa_resource_apply_gradient_descent";
+    if (node_map.find(fused_name) != node_map.end()) continue;
+
+    NodeDef* fused = graph->add_node();
+    fused->set_name(fused_name);
+    fused->set_op("ResourceApplyGradientDescent");
+    fused->set_device(assign_add.device());
+    fused->add_input(assign_add.input(0));
+    fused->add_input(lr_input);
+    fused->add_input(grad_input);
+    for (const auto& input : assign_add.input()) {
+      if (!input.empty() && input[0] == '^') {
+        fused->add_input(input);
+      }
+    }
+    (*fused->mutable_attr())["T"].set_type(DT_FLOAT);
+    (*fused->mutable_attr())["use_locking"].set_b(true);
+
+    RedirectNodeOutputs(graph, assign_add.name(), fused_name);
+    RedirectNodeOutputs(graph, slot_assign->name(), fused_name);
+    RedirectNodeOutputs(graph, slot_read->name(), fused_name);
+    RedirectNodeOutputs(graph, add->name(), fused_name);
+    for (const string& name : local_remove) {
+      RedirectNodeOutputs(graph, name, fused_name);
+    }
+    remove_names.insert(assign_add.name());
+    remove_names.insert(slot_assign->name());
+    remove_names.insert(slot_read->name());
+    remove_names.insert(add->name());
+    for (const string& name : local_remove) {
+      remove_names.insert(name);
+    }
+    rewrites++;
+  }
+
+  RemoveNodesByName(graph, remove_names);
+  if (rewrites > 0) {
+    LOG(INFO) << "MusaGraphOptimizer: Rewrote " << rewrites
+              << " TF2.15 SGD update node(s) with ResourceApplyGradientDescent";
+  }
+  return rewrites;
+}
+
+bool AddInputIfMissing(NodeDef* node, const string& input) {
+  for (const auto& existing : node->input()) {
+    if (existing == input) return false;
+  }
+  node->add_input(input);
+  return true;
+}
+
+bool ConsumersAreSubset(
+    const std::unordered_map<string, std::vector<string>>& consumers,
+    const string& producer, const std::unordered_set<string>& allowed) {
+  const auto it = consumers.find(producer);
+  if (it == consumers.end()) return true;
+  for (const string& consumer : it->second) {
+    if (allowed.find(consumer) == allowed.end()) return false;
+  }
+  return true;
+}
+
+NodeDef* MutableNodeByName(
+    GraphDef* graph, const std::unordered_map<string, int>& node_index,
+    const string& name) {
+  const auto it = node_index.find(name);
+  return it == node_index.end() ? nullptr : graph->mutable_node(it->second);
+}
+
+bool TryBypassTf215SparseSgdAggregation(
+    GraphDef* graph, const NodeDef* scatter,
+    const std::unordered_map<string, const NodeDef*>& node_map,
+    const std::unordered_map<string, int>& node_index,
+    const std::unordered_map<string, std::vector<string>>& consumers,
+    string* indices_input, std::vector<string>* remove_names) {
+  if (scatter == nullptr || scatter->input_size() < 3) return false;
+
+  auto find_node = [&](const string& input) -> const NodeDef* {
+    const auto it = node_map.find(NodeNameFromInputLocal(input));
+    return it == node_map.end() ? nullptr : it->second;
+  };
+
+  const NodeDef* unique = find_node(scatter->input(1));
+  const NodeDef* update_mul = find_node(scatter->input(2));
+  if (unique == nullptr || unique->op() != "Unique" ||
+      unique->input_size() < 1 || update_mul == nullptr ||
+      update_mul->op() != "Mul" || update_mul->input_size() != 2 ||
+      !HasFloatTypeAttr(*update_mul)) {
+    return false;
+  }
+
+  const NodeDef* neg = nullptr;
+  for (int input_idx = 0; input_idx < 2; ++input_idx) {
+    const NodeDef* input = find_node(update_mul->input(input_idx));
+    if (input != nullptr && input->op() == "Neg" && input->input_size() == 1 &&
+        HasFloatTypeAttr(*input)) {
+      neg = input;
+      break;
+    }
+  }
+  if (neg == nullptr) return false;
+
+  const NodeDef* segment_sum = find_node(neg->input(0));
+  if (segment_sum == nullptr || segment_sum->op() != "UnsortedSegmentSum" ||
+      segment_sum->input_size() < 3 || !HasFloatTypeAttr(*segment_sum) ||
+      NodeNameFromInputLocal(segment_sum->input(1)) != unique->name() ||
+      segment_sum->input(1).find(":1") == string::npos) {
+    return false;
+  }
+
+  const NodeDef* num_segments = find_node(segment_sum->input(2));
+  if (num_segments == nullptr || num_segments->op() != "StridedSlice" ||
+      num_segments->input_size() < 1) {
+    return false;
+  }
+  const NodeDef* shape = find_node(num_segments->input(0));
+  if (shape == nullptr || shape->op() != "Shape" || shape->input_size() < 1 ||
+      NodeNameFromInputLocal(shape->input(0)) != unique->name()) {
+    return false;
+  }
+
+  const std::unordered_set<string> unique_consumers = {
+      scatter->name(), shape->name(), segment_sum->name()};
+  if (!ConsumersAreSubset(consumers, unique->name(), unique_consumers) ||
+      !ConsumersAreSubset(consumers, segment_sum->name(), {neg->name()}) ||
+      !ConsumersAreSubset(consumers, shape->name(), {num_segments->name()}) ||
+      !ConsumersAreSubset(consumers, num_segments->name(),
+                          {segment_sum->name()})) {
+    return false;
+  }
+
+  NodeDef* neg_mutable = MutableNodeByName(graph, node_index, neg->name());
+  if (neg_mutable == nullptr) return false;
+  neg_mutable->set_input(0, segment_sum->input(0));
+  *indices_input = unique->input(0);
+  remove_names->push_back(unique->name());
+  remove_names->push_back(segment_sum->name());
+  remove_names->push_back(shape->name());
+  remove_names->push_back(num_segments->name());
+  return true;
+}
+
+int OptimizeTf215SparseSgdAssignAdd(GraphDef* graph) {
+  std::unordered_map<string, const NodeDef*> node_map;
+  std::unordered_map<string, int> node_index;
+  node_map.reserve(graph->node_size());
+  node_index.reserve(graph->node_size());
+  for (int i = 0; i < graph->node_size(); ++i) {
+    const NodeDef& node = graph->node(i);
+    node_map[node.name()] = &node;
+    node_index[node.name()] = i;
+  }
+
+  auto find_node = [&](const string& input) -> const NodeDef* {
+    const auto it = node_map.find(NodeNameFromInputLocal(input));
+    return it == node_map.end() ? nullptr : it->second;
+  };
+
+  auto find_mutable_node = [&](const string& name) -> NodeDef* {
+    const auto it = node_index.find(name);
+    return it == node_index.end() ? nullptr : graph->mutable_node(it->second);
+  };
+
+  std::unordered_map<string, std::vector<string>> consumers;
+  for (const auto& node : graph->node()) {
+    for (const auto& input : node.input()) {
+      consumers[NodeNameFromInputLocal(input)].push_back(node.name());
+    }
+  }
+
+  std::unordered_set<string> remove_names;
+  int rewrites = 0;
+  const int original_node_size = graph->node_size();
+  for (int i = 0; i < original_node_size; ++i) {
+    const NodeDef& assign_add = graph->node(i);
+    if (assign_add.op() != "AssignAddVariableOp" ||
+        assign_add.input_size() < 2 ||
+        assign_add.name().find("SGD/") != 0) {
+      continue;
+    }
+    const auto dtype_it = assign_add.attr().find("dtype");
+    if (dtype_it == assign_add.attr().end() ||
+        dtype_it->second.type() != DT_FLOAT) {
+      continue;
+    }
+
+    const NodeDef* slot_read = find_node(assign_add.input(1));
+    if (slot_read == nullptr || slot_read->op() != "ReadVariableOp" ||
+        slot_read->input_size() < 2) {
+      continue;
+    }
+
+    const string slot_resource = slot_read->input(0);
+    const NodeDef* scatter = nullptr;
+    for (int input_idx = 1; input_idx < slot_read->input_size(); ++input_idx) {
+      const string& ctrl = slot_read->input(input_idx);
+      if (ctrl.empty() || ctrl[0] != '^') continue;
+      const NodeDef* ctrl_node = find_node(ctrl);
+      if (ctrl_node != nullptr && ctrl_node->op() == "ResourceScatterAdd" &&
+          ctrl_node->input_size() >= 3 &&
+          NodeNameFromInputLocal(ctrl_node->input(0)) ==
+              NodeNameFromInputLocal(slot_resource)) {
+        const auto scatter_dtype_it = ctrl_node->attr().find("dtype");
+        if (scatter_dtype_it != ctrl_node->attr().end() &&
+            scatter_dtype_it->second.type() == DT_FLOAT) {
+          scatter = ctrl_node;
+          break;
+        }
+      }
+    }
+    if (scatter == nullptr) continue;
+
+    const NodeDef* slot_assign = nullptr;
+    for (int input_idx = 3; input_idx < scatter->input_size(); ++input_idx) {
+      const string& ctrl = scatter->input(input_idx);
+      if (ctrl.empty() || ctrl[0] != '^') continue;
+      const NodeDef* ctrl_node = find_node(ctrl);
+      if (ctrl_node != nullptr && ctrl_node->op() == "AssignVariableOp" &&
+          ctrl_node->input_size() >= 2 &&
+          NodeNameFromInputLocal(ctrl_node->input(0)) ==
+              NodeNameFromInputLocal(slot_resource)) {
+        slot_assign = ctrl_node;
+        break;
+      }
+    }
+    if (slot_assign == nullptr) continue;
+
+    std::vector<string> local_remove;
+    if (!ExtractTf215SgdZeroSlotMul(find_node(slot_assign->input(1)),
+                                    slot_resource, node_map,
+                                    &local_remove)) {
+      continue;
+    }
+    if (NodeNameFromInputLocal(assign_add.input(0)) ==
+        NodeNameFromInputLocal(slot_resource)) {
+      continue;
+    }
+
+    NodeDef* scatter_mutable = find_mutable_node(scatter->name());
+    if (scatter_mutable == nullptr) continue;
+
+    const string scatter_name = scatter->name();
+    string indices_input = scatter->input(1);
+    const string updates_input = scatter->input(2);
+    std::vector<string> aggregation_remove;
+    if (TryBypassTf215SparseSgdAggregation(
+            graph, scatter, node_map, node_index, consumers, &indices_input,
+            &aggregation_remove)) {
+      local_remove.insert(local_remove.end(), aggregation_remove.begin(),
+                          aggregation_remove.end());
+    }
+    scatter_mutable->clear_input();
+    scatter_mutable->add_input(assign_add.input(0));
+    scatter_mutable->add_input(indices_input);
+    scatter_mutable->add_input(updates_input);
+    for (int input_idx = 3; input_idx < scatter->input_size(); ++input_idx) {
+      const string& input = scatter->input(input_idx);
+      if (NodeNameFromInputLocal(input) != slot_assign->name()) {
+        AddInputIfMissing(scatter_mutable, input);
+      }
+    }
+    for (int input_idx = 2; input_idx < assign_add.input_size(); ++input_idx) {
+      const string& input = assign_add.input(input_idx);
+      if (!input.empty() && input[0] == '^') {
+        AddInputIfMissing(scatter_mutable, input);
+      }
+    }
+
+    RedirectNodeOutputs(graph, assign_add.name(), scatter_name);
+    RedirectNodeOutputs(graph, slot_assign->name(), scatter_name);
+    RedirectNodeOutputs(graph, slot_read->name(), scatter_name);
+    for (const string& name : local_remove) {
+      RedirectNodeOutputs(graph, name, scatter_name);
+    }
+    remove_names.insert(assign_add.name());
+    remove_names.insert(slot_assign->name());
+    remove_names.insert(slot_read->name());
+    for (const string& name : local_remove) {
+      remove_names.insert(name);
+    }
+    rewrites++;
+  }
+
+  RemoveNodesByName(graph, remove_names);
+  if (rewrites > 0) {
+    LOG(INFO) << "MusaGraphOptimizer: Rewrote " << rewrites
+              << " TF2.15 sparse SGD slot update node(s) with ResourceScatterAdd";
+  }
+  return rewrites;
+}
+
 int OptimizeRmsNormSqrtGradDxWarp128(GraphDef* graph) {
   std::unordered_map<string, const NodeDef*> node_map;
   node_map.reserve(graph->node_size());
@@ -1096,15 +1542,24 @@ int OptimizeRmsNormSqrtGradDxWarp128(GraphDef* graph) {
   for (int i = 0; i < original_node_size; ++i) {
     const NodeDef& direct = graph->node(i);
     static const string kDirectSuffix = "/truediv/Reshape";
-    if (direct.op() != "Reshape" || !HasFloatTypeAttr(direct) ||
+    static const string kRealDivDirectSuffix = "/truediv/RealDiv";
+    const bool is_legacy_direct =
+        direct.op() == "Reshape" &&
+        StringEndsWithLocal(direct.name(), kDirectSuffix);
+    const bool is_tf215_direct =
+        direct.op() == "RealDiv" &&
+        StringEndsWithLocal(direct.name(), kRealDivDirectSuffix);
+    if (!HasFloatTypeAttr(direct) ||
         direct.name().find("gradient_tape/") == string::npos ||
         direct.name().find("rms_layer_norm") == string::npos ||
-        !StringEndsWithLocal(direct.name(), kDirectSuffix)) {
+        (!is_legacy_direct && !is_tf215_direct)) {
       continue;
     }
 
+    const string direct_suffix =
+        is_legacy_direct ? kDirectSuffix : kRealDivDirectSuffix;
     const string prefix =
-        direct.name().substr(0, direct.name().size() - kDirectSuffix.size());
+        direct.name().substr(0, direct.name().size() - direct_suffix.size());
     const string forward_prefix = prefix.substr(strlen("gradient_tape/"));
     const string forward_fused_name = forward_prefix + "/mul";
     const string correction_name = prefix + "/Mul_1";
@@ -1604,9 +2059,9 @@ int OptimizeDropoutScaledMaskMul(GraphDef* graph) {
   };
 
   auto create_fused = [&](const NodeDef& old_node, const string& data_input,
-                          const NodeDef* cast, float scale,
+                          const string& mask_input, float scale,
                           std::unordered_set<string>* remove_names) -> bool {
-    if (cast == nullptr) return false;
+    if (mask_input.empty()) return false;
     const string fused_name = old_node.name() + "/musa_scaled_masked_mul";
     if (node_map.find(fused_name) != node_map.end()) return false;
 
@@ -1615,7 +2070,7 @@ int OptimizeDropoutScaledMaskMul(GraphDef* graph) {
     fused->set_op("MusaScaledMaskedMul");
     fused->set_device(old_node.device());
     fused->add_input(data_input);
-    fused->add_input(cast->input(0));
+    fused->add_input(mask_input);
     (*fused->mutable_attr())["T"].set_type(DT_FLOAT);
     (*fused->mutable_attr())["scale"].set_f(scale);
 
@@ -1628,16 +2083,66 @@ int OptimizeDropoutScaledMaskMul(GraphDef* graph) {
   int rewrites = 0;
   const int original_node_size = graph->node_size();
   for (int i = 0; i < original_node_size; ++i) {
-    const NodeDef& final_mul = graph->node(i);
+    const NodeDef& node = graph->node(i);
+    if (node.name().find("/dropout") == string::npos) {
+      continue;
+    }
+
+    if (node.op() == "SelectV2" && node.input_size() == 3 &&
+        HasFloatTypeAttr(node)) {
+      const NodeDef* pred = find_node(node.input(0));
+      const NodeDef* scaled_mul = find_node(node.input(1));
+      const NodeDef* false_value = find_node(node.input(2));
+      string data_input;
+      float scale = 0.0f;
+      if (pred != nullptr && pred->op() == "GreaterEqual" &&
+          IsFloatZeroConst(false_value) &&
+          TryGetMulConstScale(scaled_mul, node_map, &data_input, &scale)) {
+        if (create_fused(node, data_input, node.input(0), scale,
+                         &remove_names)) {
+          if (IsOnlyConsumer(consumers, scaled_mul->name(), node.name())) {
+            remove_names.insert(scaled_mul->name());
+          }
+          rewrites++;
+        }
+        continue;
+      }
+    }
+
+    const NodeDef& final_mul = node;
     if (final_mul.op() != "Mul" || final_mul.input_size() != 2 ||
-        !HasFloatTypeAttr(final_mul) ||
-        final_mul.name().find("/dropout") == string::npos) {
+        !HasFloatTypeAttr(final_mul)) {
       continue;
     }
 
     const NodeDef* in0 = find_node(final_mul.input(0));
     const NodeDef* in1 = find_node(final_mul.input(1));
     if (in0 == nullptr || in1 == nullptr) continue;
+
+    const NodeDef* select = nullptr;
+    float select_scale = 0.0f;
+    if (GetConstScalarFloat(in0, &select_scale) && in1->op() == "SelectV2") {
+      select = in1;
+    } else if (GetConstScalarFloat(in1, &select_scale) &&
+               in0->op() == "SelectV2") {
+      select = in0;
+    }
+    if (select != nullptr && select->input_size() == 3 &&
+        HasFloatTypeAttr(*select)) {
+      const NodeDef* pred = find_node(select->input(0));
+      const NodeDef* false_value = find_node(select->input(2));
+      if (pred != nullptr && pred->op() == "GreaterEqual" &&
+          IsFloatZeroConst(false_value)) {
+        if (create_fused(final_mul, select->input(1), select->input(0),
+                         select_scale, &remove_names)) {
+          if (IsOnlyConsumer(consumers, select->name(), final_mul.name())) {
+            remove_names.insert(select->name());
+          }
+          rewrites++;
+        }
+        continue;
+      }
+    }
 
     const NodeDef* cast = nullptr;
     const NodeDef* scaled_mul = nullptr;
@@ -1653,7 +2158,8 @@ int OptimizeDropoutScaledMaskMul(GraphDef* graph) {
     float scale = 0.0f;
     if (cast != nullptr &&
         TryGetMulConstScale(scaled_mul, node_map, &data_input, &scale)) {
-      if (create_fused(final_mul, data_input, cast, scale, &remove_names)) {
+      if (create_fused(final_mul, data_input, cast->input(0), scale,
+                       &remove_names)) {
         const auto scaled_consumer_it = consumers.find(scaled_mul->name());
         if (scaled_consumer_it == consumers.end() ||
             (scaled_consumer_it->second.size() == 1 &&
@@ -1691,8 +2197,8 @@ int OptimizeDropoutScaledMaskMul(GraphDef* graph) {
     }
     if (mask_cast == nullptr) continue;
 
-    if (create_fused(final_mul, mask_mul_input, mask_cast, final_scale,
-                     &remove_names)) {
+    if (create_fused(final_mul, mask_mul_input, mask_cast->input(0),
+                     final_scale, &remove_names)) {
       remove_names.insert(scale_mul->name());
       rewrites++;
     }
@@ -2095,7 +2601,7 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
         }
       }
     }
-    return Status::OK();
+    return ::tensorflow::OkStatus();
   }
 
   Status Optimize(Cluster* cluster, const GrapplerItem& item,
@@ -2111,7 +2617,7 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
       VLOG(2)
           << "MusaGraphOptimizer: No MUSA nodes found, skipping optimization";
       dumper.DumpFinal(*optimized_graph);
-      return Status::OK();
+      return ::tensorflow::OkStatus();
     }
 
     VLOG(1) << "MusaGraphOptimizer: Optimizing graph with "
@@ -2201,6 +2707,17 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
       dumper.DumpAtStage(*optimized_graph,
                          "after_rmsnorm_sqrt_grad_dx_warp128_fusion");
     }
+    const int tf215_sgd_rewrites = OptimizeTf215SgdAssignAdd(optimized_graph);
+    if (tf215_sgd_rewrites > 0) {
+      dumper.DumpAtStage(*optimized_graph,
+                         "after_tf215_sgd_assign_add_fusion");
+    }
+    const int tf215_sparse_sgd_rewrites =
+        OptimizeTf215SparseSgdAssignAdd(optimized_graph);
+    if (tf215_sparse_sgd_rewrites > 0) {
+      dumper.DumpAtStage(*optimized_graph,
+                         "after_tf215_sparse_sgd_assign_add_fusion");
+    }
     if (configs_.optimizer_remove_ios_node != TriState::kOff) {
       const int removed_isolated_nodes = RemoveIsolatedNodes(optimized_graph);
       if (removed_isolated_nodes > 0) {
@@ -2222,7 +2739,7 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
         VLOG(2) << "  - " << node.name() << " (" << node.op() << ")";
       }
     }
-    return Status::OK();
+    return ::tensorflow::OkStatus();
   }
 
   // Feedback method removed - not available in TF 2.6.1 CustomGraphOptimizer
@@ -2243,7 +2760,7 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
 
     if (patterns.empty()) {
       VLOG(1) << "MusaGraphOptimizer: No fusion patterns registered";
-      return Status::OK();
+      return ::tensorflow::OkStatus();
     }
 
     VLOG(1) << "MusaGraphOptimizer: Applying " << patterns.size()
@@ -2269,7 +2786,7 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
     if (priority_groups.empty()) {
       VLOG(1) << "MusaGraphOptimizer: No enabled fusion patterns after "
               << kDisabledFusionPatternsParam << " filtering";
-      return Status::OK();
+      return ::tensorflow::OkStatus();
     }
 
     auto run_scan =
@@ -2384,7 +2901,7 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
             << "Applied: " << fusion_applied_count
             << ", Fallbacks: " << fusion_fallback_count;
 
-    return Status::OK();
+    return ::tensorflow::OkStatus();
   }
 
  private:
@@ -2675,13 +3192,13 @@ class MusaAutoGraphOptimizationPass : public ::tensorflow::GraphOptimizationPass
  public:
   Status Run(const ::tensorflow::GraphOptimizationPassOptions& options) override {
     if (options.graph == nullptr || options.graph->get() == nullptr) {
-      return Status::OK();
+      return ::tensorflow::OkStatus();
     }
 
     GraphDef graph_def;
     (*options.graph)->ToGraphDef(&graph_def);
     if (graph_def.node_size() == 0) {
-      return Status::OK();
+      return ::tensorflow::OkStatus();
     }
 
     GrapplerItem item;
@@ -2704,7 +3221,7 @@ class MusaAutoGraphOptimizationPass : public ::tensorflow::GraphOptimizationPass
     options.graph->swap(new_graph);
     LOG(INFO) << "MusaAutoGraphOptimizationPass applied to graph with "
               << graph_def.node_size() << " node(s)";
-    return Status::OK();
+    return ::tensorflow::OkStatus();
   }
 };
 

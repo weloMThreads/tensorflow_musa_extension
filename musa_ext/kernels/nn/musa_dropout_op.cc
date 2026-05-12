@@ -212,7 +212,7 @@ REGISTER_OP("MusaDropout")
     .SetShapeFn([](::tensorflow::shape_inference::InferenceContext* c) {
       c->set_output(0, c->input(0));
       c->set_output(1, c->input(0));
-      return Status::OK();
+      return ::tensorflow::OkStatus();
     });
 
 REGISTER_OP("MusaDropoutGrad")
@@ -223,7 +223,7 @@ REGISTER_OP("MusaDropoutGrad")
     .Attr("rate: float = 0.5")
     .SetShapeFn([](::tensorflow::shape_inference::InferenceContext* c) {
       c->set_output(0, c->input(0));
-      return Status::OK();
+      return ::tensorflow::OkStatus();
     });
 
 REGISTER_OP("MusaScaledMaskedMul")
@@ -234,7 +234,7 @@ REGISTER_OP("MusaScaledMaskedMul")
     .Attr("scale: float")
     .SetShapeFn([](::tensorflow::shape_inference::InferenceContext* c) {
       c->set_output(0, c->input(0));
-      return Status::OK();
+      return ::tensorflow::OkStatus();
     });
 
 }  // namespace tensorflow

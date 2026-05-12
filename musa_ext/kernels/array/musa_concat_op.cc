@@ -229,7 +229,7 @@ REGISTER_OP("MusaConcatWithSliceGrad")
     .Attr("inner_dim: int")
     .SetShapeFn([](::tensorflow::shape_inference::InferenceContext* c) {
       c->set_output(0, c->UnknownShape());
-      return Status::OK();
+      return ::tensorflow::OkStatus();
     });
 
 }  // namespace tensorflow

@@ -13,7 +13,7 @@ set -e
 # ============================================================================
 
 # Required TensorFlow version
-REQUIRED_TF_VERSION="2.6.1"
+REQUIRED_TF_VERSION="2.15.0"
 
 # Function to check TensorFlow version
 check_tf_version() {

@@ -38,7 +38,7 @@ RUNTIME_CONFIG_BINDINGS_PATTERN = f"{RUNTIME_CONFIG_BINDINGS}*.so"
 BUILD_DIR = "build"
 
 # Required TensorFlow version
-REQUIRED_TF_VERSION = "2.6.1"
+REQUIRED_TF_VERSION = "2.15.0"
 
 
 def check_tensorflow_version():
