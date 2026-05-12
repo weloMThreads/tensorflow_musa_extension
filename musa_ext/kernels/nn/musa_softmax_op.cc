@@ -16,6 +16,10 @@ extern "C" void LaunchMusaSmallLastDimSoftmaxFloat(const float* input,
 extern "C" void LaunchMusaSmallLastDimCausalMaskedSoftmaxFloat(
     const float* input, const float* scale, float* output, int64_t outer_size,
     int query_dim, int key_dim, musaStream_t stream);
+extern "C" void LaunchMusaSmallLastDimCausalMaskedSoftmaxBFloat16(
+    const tensorflow::bfloat16* input, const tensorflow::bfloat16* scale,
+    tensorflow::bfloat16* output, int64_t outer_size, int query_dim,
+    int key_dim, musaStream_t stream);
 
 bool EnvFlagValueIsFalse(const char* value) {
   return value != nullptr && value[0] != '\0' &&
@@ -106,12 +110,12 @@ class MusaCausalMaskedSoftmaxOp : public MusaOpKernel {
   void Compute(OpKernelContext* ctx) override {
     const Tensor& logits = ctx->input(0);
     const Tensor& scale = ctx->input(1);
-    OP_REQUIRES(ctx, logits.dtype() == DT_FLOAT,
+    OP_REQUIRES(ctx, logits.dtype() == DT_FLOAT || logits.dtype() == DT_BFLOAT16,
                 errors::InvalidArgument(
-                    "MusaCausalMaskedSoftmax expects float logits"));
-    OP_REQUIRES(ctx, scale.dtype() == DT_FLOAT,
+                    "MusaCausalMaskedSoftmax expects float/bfloat16 logits"));
+    OP_REQUIRES(ctx, scale.dtype() == logits.dtype(),
                 errors::InvalidArgument(
-                    "MusaCausalMaskedSoftmax expects float scale"));
+                    "MusaCausalMaskedSoftmax expects scale dtype to match logits"));
     OP_REQUIRES(ctx, scale.NumElements() == 1,
                 errors::InvalidArgument(
                     "MusaCausalMaskedSoftmax expects scalar scale, got ",
@@ -136,10 +140,18 @@ class MusaCausalMaskedSoftmaxOp : public MusaOpKernel {
 
     const int64_t outer_size = logits.NumElements() / key_dim;
     auto& h = GetHandleByCtx(ctx);
-    LaunchMusaSmallLastDimCausalMaskedSoftmaxFloat(
-        logits.flat<float>().data(), scale.flat<float>().data(),
-        output->flat<float>().data(), outer_size, static_cast<int>(query_dim),
-        static_cast<int>(key_dim), reinterpret_cast<musaStream_t>(h.GetStream()));
+    musaStream_t stream = reinterpret_cast<musaStream_t>(h.GetStream());
+    if (logits.dtype() == DT_FLOAT) {
+      LaunchMusaSmallLastDimCausalMaskedSoftmaxFloat(
+          logits.flat<float>().data(), scale.flat<float>().data(),
+          output->flat<float>().data(), outer_size, static_cast<int>(query_dim),
+          static_cast<int>(key_dim), stream);
+    } else {
+      LaunchMusaSmallLastDimCausalMaskedSoftmaxBFloat16(
+          logits.flat<bfloat16>().data(), scale.flat<bfloat16>().data(),
+          output->flat<bfloat16>().data(), outer_size,
+          static_cast<int>(query_dim), static_cast<int>(key_dim), stream);
+    }
   }
 };
 
@@ -168,9 +180,10 @@ REGISTER_KERNEL_BUILDER(Name("MusaCausalMaskedSoftmax").Device("MUSA"),
 }  // namespace musa
 
 REGISTER_OP("MusaCausalMaskedSoftmax")
-    .Input("logits: float")
-    .Input("scale: float")
-    .Output("softmax: float")
+    .Input("logits: T")
+    .Input("scale: T")
+    .Output("softmax: T")
+    .Attr("T: {float, bfloat16}")
     .SetShapeFn([](::tensorflow::shape_inference::InferenceContext* c) {
       c->set_output(0, c->input(0));
       return ::tensorflow::OkStatus();

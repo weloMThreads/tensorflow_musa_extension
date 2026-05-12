@@ -352,6 +352,93 @@ void LaunchResourceGatherHalfInt64(const void* params, const int64_t* indices, v
       params_stride, limit);
 }
 
+void LaunchResourceGatherBFloat16Int32(const void* params, const int* indices, void* output,
+                                       int64_t batch_size, int64_t inner_size,
+                                       int64_t indices_size, int64_t params_stride,
+                                       int limit, musaStream_t stream) {
+  const int64_t total_elements = batch_size * indices_size * inner_size;
+  if (total_elements == 0) return;
+  const int blocks = OPTIMAL_BLOCKS(total_elements);
+  ResourceGatherKernel<__mt_bfloat16, int><<<blocks, OPTIMAL_THREADS, 0, stream>>>(
+      reinterpret_cast<const __mt_bfloat16*>(params), indices,
+      reinterpret_cast<__mt_bfloat16*>(output), batch_size, inner_size,
+      indices_size, params_stride, limit);
+}
+
+void LaunchResourceGatherBFloat16Int64(const void* params, const int64_t* indices,
+                                       void* output, int64_t batch_size,
+                                       int64_t inner_size, int64_t indices_size,
+                                       int64_t params_stride, int64_t limit,
+                                       musaStream_t stream) {
+  const int64_t total_elements = batch_size * indices_size * inner_size;
+  if (total_elements == 0) return;
+  const int blocks = OPTIMAL_BLOCKS(total_elements);
+  ResourceGatherKernel<__mt_bfloat16, int64_t>
+      <<<blocks, OPTIMAL_THREADS, 0, stream>>>(
+          reinterpret_cast<const __mt_bfloat16*>(params), indices,
+          reinterpret_cast<__mt_bfloat16*>(output), batch_size, inner_size,
+          indices_size, params_stride, limit);
+}
+
+__global__ void ResourceScatterSubBFloat16Int32Kernel(
+    float* __restrict__ params, const int* __restrict__ indices,
+    const __mt_bfloat16* __restrict__ updates, float alpha,
+    int64_t indices_size, int64_t inner_size, int limit) {
+  const int64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t total_elements = indices_size * inner_size;
+  if (tid >= total_elements) return;
+
+  const int64_t inner_idx = tid % inner_size;
+  const int64_t indices_idx = tid / inner_size;
+  const int index = indices[indices_idx];
+  if (index < 0 || index >= limit) return;
+
+  const float update = -alpha * __bfloat162float(updates[tid]);
+  atomicAdd(&params[static_cast<int64_t>(index) * inner_size + inner_idx],
+            update);
+}
+
+__global__ void ResourceScatterSubBFloat16Int64Kernel(
+    float* __restrict__ params, const int64_t* __restrict__ indices,
+    const __mt_bfloat16* __restrict__ updates, float alpha,
+    int64_t indices_size, int64_t inner_size, int64_t limit) {
+  const int64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t total_elements = indices_size * inner_size;
+  if (tid >= total_elements) return;
+
+  const int64_t inner_idx = tid % inner_size;
+  const int64_t indices_idx = tid / inner_size;
+  const int64_t index = indices[indices_idx];
+  if (index < 0 || index >= limit) return;
+
+  const float update = -alpha * __bfloat162float(updates[tid]);
+  atomicAdd(&params[index * inner_size + inner_idx], update);
+}
+
+void LaunchResourceScatterSubBFloat16Int32(
+    float* params, const int* indices, const void* updates, float alpha,
+    int64_t indices_size, int64_t inner_size, int64_t limit,
+    musaStream_t stream) {
+  const int64_t total_elements = indices_size * inner_size;
+  if (total_elements == 0) return;
+  const int blocks = OPTIMAL_BLOCKS(total_elements);
+  ResourceScatterSubBFloat16Int32Kernel<<<blocks, OPTIMAL_THREADS, 0, stream>>>(
+      params, indices, reinterpret_cast<const __mt_bfloat16*>(updates),
+      alpha, indices_size, inner_size, static_cast<int>(limit));
+}
+
+void LaunchResourceScatterSubBFloat16Int64(
+    float* params, const int64_t* indices, const void* updates, float alpha,
+    int64_t indices_size, int64_t inner_size, int64_t limit,
+    musaStream_t stream) {
+  const int64_t total_elements = indices_size * inner_size;
+  if (total_elements == 0) return;
+  const int blocks = OPTIMAL_BLOCKS(total_elements);
+  ResourceScatterSubBFloat16Int64Kernel<<<blocks, OPTIMAL_THREADS, 0, stream>>>(
+      params, indices, reinterpret_cast<const __mt_bfloat16*>(updates),
+      alpha, indices_size, inner_size, limit);
+}
+
 #undef DEFINE_RESOURCE_GATHER_LAUNCHER
 
 #undef OPTIMAL_THREADS

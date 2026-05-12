@@ -22,10 +22,12 @@ limitations under the License.
 #include "../array/musa_fill_functor.h"
 #include "../utils_op.h"
 #include "tensorflow/core/framework/bfloat16.h"
+#include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/framework/resource_mgr.h"
 #include "tensorflow/core/framework/resource_var.h"
+#include "tensorflow/core/framework/shape_inference.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/types.h"
 
@@ -37,6 +39,10 @@ extern Status CopyTensorForUpdate(OpKernelContext* ctx, const Tensor& src,
                                   Tensor* dst);
 
 extern Status PrepareTensorForMusaUpdate(OpKernelContext* ctx, Var* var);
+
+extern "C" void LaunchResourceApplyGradientDescentFloatBFloat16(
+    float* var, const void* grad, float alpha, int64_t n,
+    musaStream_t stream);
 
 class MutexUnlocker {
  public:
@@ -160,6 +166,79 @@ REGISTER_RESOURCE_GRADIENT_DESCENT(bfloat16);
 // Note: muDNN does not support DOUBLE (float64) for binary operations (MUL,
 // SUB). Do not register for double - TensorFlow will fall back to CPU
 // implementation.
+
+REGISTER_OP("MusaResourceApplyGradientDescentMixed")
+    .Input("var: resource")
+    .Input("alpha: T")
+    .Input("delta: Tgrad")
+    .Attr("T: {float}")
+    .Attr("Tgrad: {bfloat16}")
+    .Attr("use_locking: bool = false")
+    .SetIsStateful()
+    .SetShapeFn(shape_inference::NoOutputs);
+
+class MusaResourceApplyGradientDescentMixedOp : public MusaOpKernel {
+ public:
+  explicit MusaResourceApplyGradientDescentMixedOp(OpKernelConstruction* ctx)
+      : MusaOpKernel(ctx) {
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("use_locking", &use_exclusive_lock_));
+  }
+
+  void Compute(OpKernelContext* ctx) override {
+    core::RefCountPtr<Var> var;
+    OP_REQUIRES_OK(ctx, LookupResource(ctx, HandleFromInput(ctx, 0), &var));
+
+    mutex* mu = var->mu();
+    mu->lock();
+    MutexUnlocker unlocker(mu);
+
+    OP_REQUIRES(ctx, var->tensor()->IsInitialized(),
+                errors::FailedPrecondition("Variable not initialized."));
+    OP_REQUIRES_OK(ctx, PrepareTensorForMusaUpdate(ctx, var.get()));
+
+    Tensor var_t = *var->tensor();
+    const Tensor& alpha_t = ctx->input(1);
+    const Tensor& grad_t = ctx->input(2);
+
+    OP_REQUIRES(ctx, alpha_t.NumElements() == 1,
+                errors::InvalidArgument("alpha must be a scalar, got ",
+                                        alpha_t.NumElements(), " elements"));
+    OP_REQUIRES(ctx, var_t.dtype() == DT_FLOAT,
+                errors::InvalidArgument(
+                    "MusaResourceApplyGradientDescentMixed expects float var"));
+    OP_REQUIRES(ctx, grad_t.dtype() == DT_BFLOAT16,
+                errors::InvalidArgument(
+                    "MusaResourceApplyGradientDescentMixed expects bfloat16 "
+                    "gradient"));
+    OP_REQUIRES(ctx, var_t.shape().IsSameSize(grad_t.shape()),
+                errors::InvalidArgument(
+                    "Variable and gradient must have the same shape. var: ",
+                    var_t.shape().DebugString(),
+                    " grad: ", grad_t.shape().DebugString()));
+
+    const int64_t n = var_t.NumElements();
+    if (n == 0) return;
+
+    const float alpha = alpha_t.scalar<float>()();
+    musaStream_t stream = GetMusaStreamByCtx(ctx);
+    LaunchResourceApplyGradientDescentFloatBFloat16(
+        var_t.flat<float>().data(),
+        reinterpret_cast<const void*>(grad_t.flat<bfloat16>().data()), alpha,
+        n, stream);
+  }
+
+ private:
+  bool use_exclusive_lock_;
+};
+
+REGISTER_KERNEL_BUILDER(
+    Name("MusaResourceApplyGradientDescentMixed")
+        .Device(DEVICE_MTGPU)
+        .HostMemory("var")
+        .HostMemory("alpha")
+        .TypeConstraint<float>("T")
+        .TypeConstraint<bfloat16>("Tgrad"),
+    MusaResourceApplyGradientDescentMixedOp);
 
 // ApplyGradientDescent (non-resource version)
 template <typename T>

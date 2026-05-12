@@ -15,6 +15,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <map>
 #include <cstring>
@@ -415,6 +416,10 @@ bool GetConstIntVector(const NodeDef* node, std::vector<int64_t>* values) {
   return element_count == 0 || static_cast<int64_t>(values->size()) == element_count;
 }
 
+bool IsFloatOrBFloat16Type(DataType type) {
+  return type == DT_FLOAT || type == DT_BFLOAT16;
+}
+
 struct SliceGradSegment {
   const NodeDef* node = nullptr;
   string dy_input;
@@ -437,7 +442,8 @@ bool TryParseConstAxis1SliceGrad(
     SliceGradSegment* segment) {
   if (node.op() != "StridedSliceGrad" || node.input_size() < 5) return false;
   const auto t_it = node.attr().find("T");
-  if (t_it == node.attr().end() || t_it->second.type() != DT_FLOAT) {
+  if (t_it == node.attr().end() ||
+      !IsFloatOrBFloat16Type(t_it->second.type())) {
     return false;
   }
 
@@ -520,7 +526,8 @@ bool TryParseDynamicAxis1SliceGrad(
     DynamicSliceGradSegment* segment) {
   if (node.op() != "StridedSliceGrad" || node.input_size() < 5) return false;
   const auto t_it = node.attr().find("T");
-  if (t_it == node.attr().end() || t_it->second.type() != DT_FLOAT) {
+  if (t_it == node.attr().end() ||
+      !IsFloatOrBFloat16Type(t_it->second.type())) {
     return false;
   }
 
@@ -569,7 +576,8 @@ bool TryParseConstAxis1SuffixSliceGrad(
     SliceGradSegment* segment, int64_t* inner_dim) {
   if (node.op() != "StridedSliceGrad" || node.input_size() < 5) return false;
   const auto t_it = node.attr().find("T");
-  if (t_it == node.attr().end() || t_it->second.type() != DT_FLOAT) {
+  if (t_it == node.attr().end() ||
+      !IsFloatOrBFloat16Type(t_it->second.type())) {
     return false;
   }
 
@@ -660,18 +668,43 @@ bool StringEndsWithLocal(const string& value, const string& suffix) {
 
 bool HasFloatTypeAttr(const NodeDef& node) {
   const auto it = node.attr().find("T");
-  return it != node.attr().end() && it->second.type() == DT_FLOAT;
+  return it != node.attr().end() && IsFloatOrBFloat16Type(it->second.type());
+}
+
+DataType GetNodeTypeAttr(const NodeDef& node) {
+  const auto it = node.attr().find("T");
+  return it == node.attr().end() ? DT_INVALID : it->second.type();
+}
+
+float BFloat16BitsToFloat(uint16_t bits) {
+  uint32_t raw = static_cast<uint32_t>(bits) << 16;
+  float value = 0.0f;
+  std::memcpy(&value, &raw, sizeof(value));
+  return value;
 }
 
 bool GetConstScalarFloat(const NodeDef* node, float* value) {
   if (node == nullptr || node->op() != "Const") return false;
   const auto dtype_it = node->attr().find("dtype");
   const auto value_it = node->attr().find("value");
-  if (dtype_it == node->attr().end() || value_it == node->attr().end() ||
-      dtype_it->second.type() != DT_FLOAT) {
+  if (dtype_it == node->attr().end() || value_it == node->attr().end()) {
     return false;
   }
+  const DataType dtype = dtype_it->second.type();
   const TensorProto& tensor = value_it->second.tensor();
+  if (dtype == DT_BFLOAT16) {
+    if (!tensor.tensor_content().empty()) {
+      if (tensor.tensor_content().size() < sizeof(uint16_t)) return false;
+      uint16_t bits = 0;
+      std::memcpy(&bits, tensor.tensor_content().data(), sizeof(bits));
+      *value = BFloat16BitsToFloat(bits);
+      return true;
+    }
+    if (tensor.half_val_size() <= 0) return false;
+    *value = BFloat16BitsToFloat(static_cast<uint16_t>(tensor.half_val(0)));
+    return true;
+  }
+  if (dtype != DT_FLOAT) return false;
   if (!tensor.tensor_content().empty()) {
     if (tensor.tensor_content().size() < sizeof(float)) return false;
     std::memcpy(value, tensor.tensor_content().data(), sizeof(float));
@@ -767,7 +800,22 @@ int OptimizeForwardRmsNorm(GraphDef* graph) {
     }
 
     const NodeDef* scale_node = find_node(gamma_input);
-    if (scale_node == nullptr || scale_node->op() != "ReadVariableOp") {
+    if (scale_node == nullptr) {
+      continue;
+    }
+    if (scale_node->op() == "Cast") {
+      const auto src_it = scale_node->attr().find("SrcT");
+      const auto dst_it = scale_node->attr().find("DstT");
+      const NodeDef* cast_input =
+          scale_node->input_size() > 0 ? find_node(scale_node->input(0)) : nullptr;
+      if (src_it == scale_node->attr().end() ||
+          dst_it == scale_node->attr().end() ||
+          src_it->second.type() != DT_FLOAT ||
+          dst_it->second.type() != GetNodeTypeAttr(*out) ||
+          cast_input == nullptr || cast_input->op() != "ReadVariableOp") {
+        continue;
+      }
+    } else if (scale_node->op() != "ReadVariableOp") {
       continue;
     }
 
@@ -862,12 +910,13 @@ int OptimizeForwardRmsNorm(GraphDef* graph) {
                                    out->name() + ":2", out->name());
     }
 
+    const DataType dtype = GetNodeTypeAttr(*out);
     out->set_op("MusaRmsNorm");
     out->clear_input();
     out->add_input(x_input);
     out->add_input(gamma_input);
     out->mutable_attr()->clear();
-    (*out->mutable_attr())["T"].set_type(DT_FLOAT);
+    (*out->mutable_attr())["T"].set_type(dtype);
     (*out->mutable_attr())["epsilon"].set_f(epsilon);
 
     remove_names.insert(norm->name());
@@ -945,7 +994,13 @@ int OptimizeRmsNormGradDxWarp128(GraphDef* graph) {
 
   auto is_read_variable = [&](const string& input) -> bool {
     const NodeDef* node = find_node(NodeNameFromInputLocal(input));
-    return node != nullptr && node->op() == "ReadVariableOp";
+    if (node == nullptr) return false;
+    if (node->op() == "ReadVariableOp") return true;
+    if (node->op() == "Cast" && node->input_size() == 1) {
+      const NodeDef* cast_input = find_node(NodeNameFromInputLocal(node->input(0)));
+      return cast_input != nullptr && cast_input->op() == "ReadVariableOp";
+    }
+    return false;
   };
 
   int rewrites = 0;
@@ -1046,7 +1101,7 @@ int OptimizeRmsNormGradDxWarp128(GraphDef* graph) {
     fused->add_input(inv_input);
     fused->add_input(gamma_input);
     fused->add_input(dy_input);
-    (*fused->mutable_attr())["T"].set_type(DT_FLOAT);
+    (*fused->mutable_attr())["T"].set_type(GetNodeTypeAttr(direct));
 
     if (!ReplaceTwoInputsWithFused(consumer, direct.name(), correction_name,
                                    fused_name)) {
@@ -1164,7 +1219,7 @@ int OptimizeTf215SgdAssignAdd(GraphDef* graph) {
     }
     const auto dtype_it = assign_add.attr().find("dtype");
     if (dtype_it == assign_add.attr().end() ||
-        dtype_it->second.type() != DT_FLOAT) {
+        !IsFloatOrBFloat16Type(dtype_it->second.type())) {
       continue;
     }
 
@@ -1224,6 +1279,7 @@ int OptimizeTf215SgdAssignAdd(GraphDef* graph) {
         assign_add.name() + "/musa_resource_apply_gradient_descent";
     if (node_map.find(fused_name) != node_map.end()) continue;
 
+    const DataType dtype = dtype_it->second.type();
     NodeDef* fused = graph->add_node();
     fused->set_name(fused_name);
     fused->set_op("ResourceApplyGradientDescent");
@@ -1236,7 +1292,7 @@ int OptimizeTf215SgdAssignAdd(GraphDef* graph) {
         fused->add_input(input);
       }
     }
-    (*fused->mutable_attr())["T"].set_type(DT_FLOAT);
+    (*fused->mutable_attr())["T"].set_type(dtype);
     (*fused->mutable_attr())["use_locking"].set_b(true);
 
     RedirectNodeOutputs(graph, assign_add.name(), fused_name);
@@ -1260,6 +1316,221 @@ int OptimizeTf215SgdAssignAdd(GraphDef* graph) {
   if (rewrites > 0) {
     LOG(INFO) << "MusaGraphOptimizer: Rewrote " << rewrites
               << " TF2.15 SGD update node(s) with ResourceApplyGradientDescent";
+  }
+  return rewrites;
+}
+
+bool IsBFloat16ToFloatCast(const NodeDef* node) {
+  if (node == nullptr || node->op() != "Cast" || node->input_size() != 1) {
+    return false;
+  }
+  const auto src_it = node->attr().find("SrcT");
+  const auto dst_it = node->attr().find("DstT");
+  return src_it != node->attr().end() && dst_it != node->attr().end() &&
+         src_it->second.type() == DT_BFLOAT16 &&
+         dst_it->second.type() == DT_FLOAT;
+}
+
+int DataConsumerCount(const GraphDef& graph, const string& producer_name) {
+  int count = 0;
+  for (const auto& node : graph.node()) {
+    for (const auto& input : node.input()) {
+      if (!input.empty() && input[0] == '^') continue;
+      if (NodeNameFromInputLocal(input) == producer_name) {
+        ++count;
+      }
+    }
+  }
+  return count;
+}
+
+int OptimizeBFloat16GradientDescentCast(GraphDef* graph) {
+  std::unordered_map<string, const NodeDef*> node_map;
+  node_map.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    node_map[node.name()] = &node;
+  }
+
+  auto find_node = [&](const string& input) -> const NodeDef* {
+    const auto it = node_map.find(NodeNameFromInputLocal(input));
+    return it == node_map.end() ? nullptr : it->second;
+  };
+
+  std::unordered_set<string> remove_names;
+  int rewrites = 0;
+  const int original_node_size = graph->node_size();
+  for (int i = 0; i < original_node_size; ++i) {
+    const NodeDef& apply = graph->node(i);
+    if (apply.op() != "ResourceApplyGradientDescent" ||
+        apply.input_size() < 3) {
+      continue;
+    }
+    const auto dtype_it = apply.attr().find("T");
+    if (dtype_it == apply.attr().end() ||
+        dtype_it->second.type() != DT_FLOAT) {
+      continue;
+    }
+
+    const NodeDef* grad_cast = find_node(apply.input(2));
+    if (!IsBFloat16ToFloatCast(grad_cast)) {
+      continue;
+    }
+
+    const string fused_name = apply.name() + "/musa_mixed_bf16";
+    if (node_map.find(fused_name) != node_map.end()) {
+      continue;
+    }
+
+    NodeDef* fused = graph->add_node();
+    fused->set_name(fused_name);
+    fused->set_op("MusaResourceApplyGradientDescentMixed");
+    fused->set_device(apply.device());
+    fused->add_input(apply.input(0));
+    fused->add_input(apply.input(1));
+    fused->add_input(grad_cast->input(0));
+    auto add_input_if_missing = [&](const string& input) {
+      for (const auto& existing : fused->input()) {
+        if (existing == input) return;
+      }
+      fused->add_input(input);
+    };
+    for (const auto& input : grad_cast->input()) {
+      if (!input.empty() && input[0] == '^') {
+        fused->add_input(input);
+      }
+    }
+    for (const auto& input : apply.input()) {
+      if (!input.empty() && input[0] == '^') {
+        add_input_if_missing(input);
+      }
+    }
+
+    (*fused->mutable_attr())["T"].set_type(DT_FLOAT);
+    (*fused->mutable_attr())["Tgrad"].set_type(DT_BFLOAT16);
+    const auto locking_it = apply.attr().find("use_locking");
+    (*fused->mutable_attr())["use_locking"].set_b(
+        locking_it != apply.attr().end() && locking_it->second.b());
+
+    RedirectNodeOutputs(graph, apply.name(), fused_name);
+    remove_names.insert(apply.name());
+    if (DataConsumerCount(*graph, grad_cast->name()) == 1) {
+      RedirectNodeOutputs(graph, grad_cast->name(), fused_name);
+      remove_names.insert(grad_cast->name());
+    }
+    ++rewrites;
+  }
+
+  RemoveNodesByName(graph, remove_names);
+  if (rewrites > 0) {
+    LOG(INFO) << "MusaGraphOptimizer: Rewrote " << rewrites
+              << " bfloat16-gradient SGD update node(s) with mixed update";
+  }
+  return rewrites;
+}
+
+int OptimizeBFloat16SparseSgdScatter(GraphDef* graph) {
+  std::unordered_map<string, const NodeDef*> node_map;
+  node_map.reserve(graph->node_size());
+  for (const auto& node : graph->node()) {
+    node_map[node.name()] = &node;
+  }
+
+  auto find_node = [&](const string& input) -> const NodeDef* {
+    const auto it = node_map.find(NodeNameFromInputLocal(input));
+    return it == node_map.end() ? nullptr : it->second;
+  };
+
+  std::unordered_set<string> remove_names;
+  int rewrites = 0;
+  const int original_node_size = graph->node_size();
+  for (int i = 0; i < original_node_size; ++i) {
+    const NodeDef& scatter = graph->node(i);
+    if (scatter.op() != "ResourceScatterAdd" || scatter.input_size() < 3) {
+      continue;
+    }
+    const auto dtype_it = scatter.attr().find("dtype");
+    const auto indices_it = scatter.attr().find("Tindices");
+    if (dtype_it == scatter.attr().end() ||
+        dtype_it->second.type() != DT_FLOAT ||
+        indices_it == scatter.attr().end()) {
+      continue;
+    }
+
+    const NodeDef* mul = find_node(scatter.input(2));
+    if (mul == nullptr || mul->op() != "Mul" || mul->input_size() != 2 ||
+        GetNodeTypeAttr(*mul) != DT_FLOAT) {
+      continue;
+    }
+
+    const NodeDef* neg = nullptr;
+    string alpha_input;
+    for (int neg_idx = 0; neg_idx < 2; ++neg_idx) {
+      const NodeDef* candidate_neg = find_node(mul->input(neg_idx));
+      if (candidate_neg != nullptr && candidate_neg->op() == "Neg" &&
+          candidate_neg->input_size() == 1 &&
+          GetNodeTypeAttr(*candidate_neg) == DT_FLOAT) {
+        neg = candidate_neg;
+        alpha_input = mul->input(1 - neg_idx);
+        break;
+      }
+    }
+    if (neg == nullptr) continue;
+
+    const NodeDef* reshape = find_node(neg->input(0));
+    if (reshape == nullptr || reshape->op() != "Reshape" ||
+        reshape->input_size() < 1 || GetNodeTypeAttr(*reshape) != DT_FLOAT) {
+      continue;
+    }
+
+    const NodeDef* cast = find_node(reshape->input(0));
+    if (!IsBFloat16ToFloatCast(cast)) {
+      continue;
+    }
+
+    const string fused_name = scatter.name() + "/musa_mixed_bf16";
+    if (node_map.find(fused_name) != node_map.end()) {
+      continue;
+    }
+
+    NodeDef* fused = graph->add_node();
+    fused->set_name(fused_name);
+    fused->set_op("MusaResourceScatterSubBFloat16");
+    fused->set_device(scatter.device());
+    fused->add_input(scatter.input(0));
+    fused->add_input(scatter.input(1));
+    fused->add_input(cast->input(0));
+    fused->add_input(alpha_input);
+    for (const auto& input : scatter.input()) {
+      if (!input.empty() && input[0] == '^') {
+        fused->add_input(input);
+      }
+    }
+
+    (*fused->mutable_attr())["T"].set_type(DT_FLOAT);
+    (*fused->mutable_attr())["Tgrad"].set_type(DT_BFLOAT16);
+    (*fused->mutable_attr())["Tindices"].set_type(indices_it->second.type());
+
+    RedirectNodeOutputs(graph, scatter.name(), fused_name);
+    remove_names.insert(scatter.name());
+    if (DataConsumerCount(*graph, mul->name()) == 1) {
+      remove_names.insert(mul->name());
+    }
+    if (DataConsumerCount(*graph, neg->name()) == 1) {
+      remove_names.insert(neg->name());
+    }
+    if (DataConsumerCount(*graph, reshape->name()) == 1) {
+      remove_names.insert(reshape->name());
+    }
+    if (DataConsumerCount(*graph, cast->name()) == 1) {
+      remove_names.insert(cast->name());
+    }
+    ++rewrites;
+  }
+
+  RemoveNodesByName(graph, remove_names);
+  if (rewrites > 0) {
+    LOG(INFO) << "MusaGraphOptimizer: Rewrote " << rewrites
+              << " bfloat16 sparse SGD scatter update node(s)";
   }
   return rewrites;
 }
@@ -1403,7 +1674,7 @@ int OptimizeTf215SparseSgdAssignAdd(GraphDef* graph) {
     }
     const auto dtype_it = assign_add.attr().find("dtype");
     if (dtype_it == assign_add.attr().end() ||
-        dtype_it->second.type() != DT_FLOAT) {
+        !IsFloatOrBFloat16Type(dtype_it->second.type())) {
       continue;
     }
 
@@ -1425,7 +1696,7 @@ int OptimizeTf215SparseSgdAssignAdd(GraphDef* graph) {
               NodeNameFromInputLocal(slot_resource)) {
         const auto scatter_dtype_it = ctrl_node->attr().find("dtype");
         if (scatter_dtype_it != ctrl_node->attr().end() &&
-            scatter_dtype_it->second.type() == DT_FLOAT) {
+            IsFloatOrBFloat16Type(scatter_dtype_it->second.type())) {
           scatter = ctrl_node;
           break;
         }
@@ -1534,7 +1805,13 @@ int OptimizeRmsNormSqrtGradDxWarp128(GraphDef* graph) {
 
   auto is_read_variable = [&](const string& input) -> bool {
     const NodeDef* node = find_node(NodeNameFromInputLocal(input));
-    return node != nullptr && node->op() == "ReadVariableOp";
+    if (node == nullptr) return false;
+    if (node->op() == "ReadVariableOp") return true;
+    if (node->op() == "Cast" && node->input_size() == 1) {
+      const NodeDef* cast_input = find_node(NodeNameFromInputLocal(node->input(0)));
+      return cast_input != nullptr && cast_input->op() == "ReadVariableOp";
+    }
+    return false;
   };
 
   int rewrites = 0;
@@ -1614,6 +1891,7 @@ int OptimizeRmsNormSqrtGradDxWarp128(GraphDef* graph) {
       continue;
     }
 
+    const DataType dtype = GetNodeTypeAttr(direct);
     NodeDef* fused = graph->add_node();
     fused->set_name(fused_name);
     fused->set_op("MusaRmsNormGradDx");
@@ -1622,7 +1900,7 @@ int OptimizeRmsNormSqrtGradDxWarp128(GraphDef* graph) {
     fused->add_input(forward_fused_name + ":2");
     fused->add_input(gamma_input);
     fused->add_input(dy_input);
-    (*fused->mutable_attr())["T"].set_type(DT_FLOAT);
+    (*fused->mutable_attr())["T"].set_type(dtype);
 
     if (!ReplaceTwoInputsWithFused(consumer, direct.name(), correction_name,
                                    fused_name)) {
@@ -1720,13 +1998,14 @@ int OptimizeExactGeluGrad(GraphDef* graph) {
     const string fused_name = addn.name() + "/musa_gelu_grad";
     if (node_map.find(fused_name) != node_map.end()) continue;
 
+    const DataType dtype = GetNodeTypeAttr(addn);
     NodeDef* fused = graph->add_node();
     fused->set_name(fused_name);
     fused->set_op("MusaGeluGrad");
     fused->set_device(addn.device());
     fused->add_input(forward_gelu->input(0));
     fused->add_input(dy_input);
-    (*fused->mutable_attr())["T"].set_type(DT_FLOAT);
+    (*fused->mutable_attr())["T"].set_type(dtype);
 
     RedirectNodeOutputs(graph, addn.name(), fused_name);
     remove_names.insert(addn.name());
@@ -1745,7 +2024,7 @@ int OptimizeExactGeluGrad(GraphDef* graph) {
 
 bool IsFloatOp(const NodeDef& node) {
   const auto it = node.attr().find("T");
-  return it != node.attr().end() && it->second.type() == DT_FLOAT;
+  return it != node.attr().end() && IsFloatOrBFloat16Type(it->second.type());
 }
 
 bool IsReductionIndexMinusOne(const NodeDef* node) {
@@ -1858,11 +2137,13 @@ int OptimizeCausalMaskedSoftmax(GraphDef* graph) {
       continue;
     }
 
+    const DataType dtype = GetNodeTypeAttr(*add);
     softmax->set_op("MusaCausalMaskedSoftmax");
     softmax->clear_input();
     softmax->add_input(scaled.logits_input);
     softmax->add_input(scaled.scale_input);
     softmax->mutable_attr()->clear();
+    (*softmax->mutable_attr())["T"].set_type(dtype);
 
     remove_names.insert(add->name());
     remove_names.insert(scaled.scale_mul->name());
@@ -1971,12 +2252,14 @@ int OptimizeSoftmaxGradSmallLastDim(GraphDef* graph) {
 
     const string fused_name = final_mul.name() + "/musa_softmax_grad";
     if (node_map.find(fused_name) != node_map.end()) continue;
+    const DataType dtype = GetNodeTypeAttr(final_mul);
     NodeDef* fused = graph->add_node();
     fused->set_name(fused_name);
     fused->set_op("MusaSoftmaxGrad");
     fused->set_device(final_mul.device());
     fused->add_input(softmax->name());
     fused->add_input(dy_input);
+    (*fused->mutable_attr())["T"].set_type(dtype);
 
     RedirectNodeOutputs(graph, final_mul.name(), fused_name);
     remove_names.insert(final_mul.name());
@@ -2002,7 +2285,8 @@ bool IsBoolToFloatCast(const NodeDef* node) {
   const auto src_it = node->attr().find("SrcT");
   const auto dst_it = node->attr().find("DstT");
   return src_it != node->attr().end() && dst_it != node->attr().end() &&
-         src_it->second.type() == DT_BOOL && dst_it->second.type() == DT_FLOAT;
+         src_it->second.type() == DT_BOOL &&
+         IsFloatOrBFloat16Type(dst_it->second.type());
 }
 
 bool TryGetMulConstScale(const NodeDef* mul,
@@ -2062,6 +2346,7 @@ int OptimizeDropoutScaledMaskMul(GraphDef* graph) {
                           const string& mask_input, float scale,
                           std::unordered_set<string>* remove_names) -> bool {
     if (mask_input.empty()) return false;
+    const DataType dtype = GetNodeTypeAttr(old_node);
     const string fused_name = old_node.name() + "/musa_scaled_masked_mul";
     if (node_map.find(fused_name) != node_map.end()) return false;
 
@@ -2071,7 +2356,7 @@ int OptimizeDropoutScaledMaskMul(GraphDef* graph) {
     fused->set_device(old_node.device());
     fused->add_input(data_input);
     fused->add_input(mask_input);
-    (*fused->mutable_attr())["T"].set_type(DT_FLOAT);
+    (*fused->mutable_attr())["T"].set_type(dtype);
     (*fused->mutable_attr())["scale"].set_f(scale);
 
     RedirectNodeOutputs(graph, old_node.name(), fused_name);
@@ -2252,7 +2537,8 @@ int OptimizeSliceGradAddNConcat(GraphDef* graph) {
     const NodeDef& addn = graph->node(i);
     if (addn.op() != "AddN" || addn.input_size() != 2) continue;
     const auto t_it = addn.attr().find("T");
-    if (t_it == addn.attr().end() || t_it->second.type() != DT_FLOAT) {
+    if (t_it == addn.attr().end() ||
+        !IsFloatOrBFloat16Type(t_it->second.type())) {
       continue;
     }
 
@@ -2334,7 +2620,7 @@ int OptimizeSliceGradAddNConcat(GraphDef* graph) {
     concat->add_input(axis_name);
     auto* concat_attr = concat->mutable_attr();
     (*concat_attr)["N"].set_i(2);
-    (*concat_attr)["T"].set_type(DT_FLOAT);
+    (*concat_attr)["T"].set_type(t_it->second.type());
     (*concat_attr)["Tidx"].set_type(DT_INT32);
 
     RedirectNodeOutputs(graph, addn.name(), concat_name);
@@ -2378,7 +2664,8 @@ int OptimizeAddNWithSuffixSliceGrad(GraphDef* graph) {
       continue;
     }
     const auto t_it = addn.attr().find("T");
-    if (t_it == addn.attr().end() || t_it->second.type() != DT_FLOAT) {
+    if (t_it == addn.attr().end() ||
+        !IsFloatOrBFloat16Type(t_it->second.type())) {
       continue;
     }
 
@@ -2424,7 +2711,7 @@ int OptimizeAddNWithSuffixSliceGrad(GraphDef* graph) {
 
     auto* attr = fused->mutable_attr();
     (*attr)["N"].set_i(num_base_inputs);
-    (*attr)["T"].set_type(DT_FLOAT);
+    (*attr)["T"].set_type(t_it->second.type());
     (*attr)["axis_dim"].set_i(segment.output_shape[1]);
     (*attr)["slice_start"].set_i(segment.start);
     (*attr)["inner_dim"].set_i(inner_dim);
@@ -2467,7 +2754,8 @@ int OptimizeConcatWithSuffixSliceGrad(GraphDef* graph) {
     const auto n_it = concat.attr().find("N");
     const auto t_it = concat.attr().find("T");
     if (n_it == concat.attr().end() || n_it->second.i() != 3 ||
-        t_it == concat.attr().end() || t_it->second.type() != DT_FLOAT) {
+        t_it == concat.attr().end() ||
+        !IsFloatOrBFloat16Type(t_it->second.type())) {
       continue;
     }
 
@@ -2506,7 +2794,7 @@ int OptimizeConcatWithSuffixSliceGrad(GraphDef* graph) {
     fused->add_input(concat.input(2));
 
     auto* attr = fused->mutable_attr();
-    (*attr)["T"].set_type(DT_FLOAT);
+    (*attr)["T"].set_type(t_it->second.type());
     (*attr)["axis_dim"].set_i(segment.output_shape[1]);
     (*attr)["slice_start"].set_i(segment.start);
     (*attr)["inner_dim"].set_i(inner_dim);
@@ -2644,79 +2932,119 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
       dumper.DumpAfterPass(*optimized_graph, "fusion");
     }
 
-    const int forward_rmsnorm_rewrites =
-        OptimizeForwardRmsNorm(optimized_graph);
-    if (forward_rmsnorm_rewrites > 0) {
-      dumper.DumpAtStage(*optimized_graph, "after_forward_rmsnorm_fusion");
+    if (!EnvFlagEnabledLocal("MUSA_DISABLE_FORWARD_RMSNORM_FUSION")) {
+      const int forward_rmsnorm_rewrites =
+          OptimizeForwardRmsNorm(optimized_graph);
+      if (forward_rmsnorm_rewrites > 0) {
+        dumper.DumpAtStage(*optimized_graph, "after_forward_rmsnorm_fusion");
+      }
     }
 
-    const int slice_grad_addn_rewrites =
-        OptimizeSliceGradAddNConcat(optimized_graph);
-    if (slice_grad_addn_rewrites > 0) {
-      dumper.DumpAtStage(*optimized_graph, "after_slice_grad_addn_concat");
+    if (!EnvFlagEnabledLocal("MUSA_DISABLE_SLICE_GRAD_ADDN_CONCAT_FUSION")) {
+      const int slice_grad_addn_rewrites =
+          OptimizeSliceGradAddNConcat(optimized_graph);
+      if (slice_grad_addn_rewrites > 0) {
+        dumper.DumpAtStage(*optimized_graph, "after_slice_grad_addn_concat");
+      }
     }
 
-    const int addn_slice_grad_rewrites =
-        OptimizeAddNWithSuffixSliceGrad(optimized_graph);
-    if (addn_slice_grad_rewrites > 0) {
-      dumper.DumpAtStage(*optimized_graph,
-                         "after_addn_suffix_slice_grad_fusion");
+    if (!EnvFlagEnabledLocal("MUSA_DISABLE_ADDN_SUFFIX_SLICE_GRAD_FUSION")) {
+      const int addn_slice_grad_rewrites =
+          OptimizeAddNWithSuffixSliceGrad(optimized_graph);
+      if (addn_slice_grad_rewrites > 0) {
+        dumper.DumpAtStage(*optimized_graph,
+                           "after_addn_suffix_slice_grad_fusion");
+      }
     }
-    const int concat_slice_grad_rewrites =
-        OptimizeConcatWithSuffixSliceGrad(optimized_graph);
-    if (concat_slice_grad_rewrites > 0) {
-      dumper.DumpAtStage(*optimized_graph,
-                         "after_concat_suffix_slice_grad_fusion");
+    if (!EnvFlagEnabledLocal("MUSA_DISABLE_CONCAT_SUFFIX_SLICE_GRAD_FUSION")) {
+      const int concat_slice_grad_rewrites =
+          OptimizeConcatWithSuffixSliceGrad(optimized_graph);
+      if (concat_slice_grad_rewrites > 0) {
+        dumper.DumpAtStage(*optimized_graph,
+                           "after_concat_suffix_slice_grad_fusion");
+      }
     }
-    const int gelu_grad_rewrites = OptimizeExactGeluGrad(optimized_graph);
-    if (gelu_grad_rewrites > 0) {
-      dumper.DumpAtStage(*optimized_graph,
-                         "after_exact_gelu_grad_fusion");
-    }
-
-    const int dropout_scaled_mask_rewrites =
-        OptimizeDropoutScaledMaskMul(optimized_graph);
-    if (dropout_scaled_mask_rewrites > 0) {
-      dumper.DumpAtStage(*optimized_graph,
-                         "after_dropout_scaled_mask_fusion");
-    }
-
-    const int causal_mask_softmax_rewrites =
-        OptimizeCausalMaskedSoftmax(optimized_graph);
-    if (causal_mask_softmax_rewrites > 0) {
-      dumper.DumpAtStage(*optimized_graph,
-                         "after_causal_mask_softmax_fusion");
+    if (!EnvFlagEnabledLocal("MUSA_DISABLE_GELU_GRAD_FUSION")) {
+      const int gelu_grad_rewrites = OptimizeExactGeluGrad(optimized_graph);
+      if (gelu_grad_rewrites > 0) {
+        dumper.DumpAtStage(*optimized_graph,
+                           "after_exact_gelu_grad_fusion");
+      }
     }
 
-    const int softmax_grad_rewrites =
-        OptimizeSoftmaxGradSmallLastDim(optimized_graph);
-    if (softmax_grad_rewrites > 0) {
-      dumper.DumpAtStage(*optimized_graph,
-                         "after_softmax_grad_fusion");
+    if (!EnvFlagEnabledLocal("MUSA_DISABLE_DROPOUT_SCALED_MASK_FUSION")) {
+      const int dropout_scaled_mask_rewrites =
+          OptimizeDropoutScaledMaskMul(optimized_graph);
+      if (dropout_scaled_mask_rewrites > 0) {
+        dumper.DumpAtStage(*optimized_graph,
+                           "after_dropout_scaled_mask_fusion");
+      }
     }
 
-    const int rms_norm_grad_dx_rewrites =
-        OptimizeRmsNormGradDxWarp128(optimized_graph);
-    if (rms_norm_grad_dx_rewrites > 0) {
-      dumper.DumpAtStage(*optimized_graph,
-                         "after_rmsnorm_grad_dx_warp128_fusion");
+    if (!EnvFlagEnabledLocal("MUSA_DISABLE_CAUSAL_MASK_SOFTMAX_FUSION")) {
+      const int causal_mask_softmax_rewrites =
+          OptimizeCausalMaskedSoftmax(optimized_graph);
+      if (causal_mask_softmax_rewrites > 0) {
+        dumper.DumpAtStage(*optimized_graph,
+                           "after_causal_mask_softmax_fusion");
+      }
     }
-    const int rms_norm_sqrt_grad_dx_rewrites =
-        OptimizeRmsNormSqrtGradDxWarp128(optimized_graph);
-    if (rms_norm_sqrt_grad_dx_rewrites > 0) {
-      dumper.DumpAtStage(*optimized_graph,
-                         "after_rmsnorm_sqrt_grad_dx_warp128_fusion");
+
+    if (!EnvFlagEnabledLocal("MUSA_DISABLE_SOFTMAX_GRAD_FUSION")) {
+      const int softmax_grad_rewrites =
+          OptimizeSoftmaxGradSmallLastDim(optimized_graph);
+      if (softmax_grad_rewrites > 0) {
+        dumper.DumpAtStage(*optimized_graph,
+                           "after_softmax_grad_fusion");
+      }
     }
-    const int tf215_sgd_rewrites = OptimizeTf215SgdAssignAdd(optimized_graph);
-    if (tf215_sgd_rewrites > 0) {
-      dumper.DumpAtStage(*optimized_graph,
-                         "after_tf215_sgd_assign_add_fusion");
+
+    if (!EnvFlagEnabledLocal("MUSA_DISABLE_RMSNORM_GRAD_DX_FUSION")) {
+      const int rms_norm_grad_dx_rewrites =
+          OptimizeRmsNormGradDxWarp128(optimized_graph);
+      if (rms_norm_grad_dx_rewrites > 0) {
+        dumper.DumpAtStage(*optimized_graph,
+                           "after_rmsnorm_grad_dx_warp128_fusion");
+      }
     }
-    const int tf215_sparse_sgd_rewrites =
-        OptimizeTf215SparseSgdAssignAdd(optimized_graph);
-    if (tf215_sparse_sgd_rewrites > 0) {
-      dumper.DumpAtStage(*optimized_graph,
-                         "after_tf215_sparse_sgd_assign_add_fusion");
+    if (!EnvFlagEnabledLocal("MUSA_DISABLE_RMSNORM_SQRT_GRAD_DX_FUSION")) {
+      const int rms_norm_sqrt_grad_dx_rewrites =
+          OptimizeRmsNormSqrtGradDxWarp128(optimized_graph);
+      if (rms_norm_sqrt_grad_dx_rewrites > 0) {
+        dumper.DumpAtStage(*optimized_graph,
+                           "after_rmsnorm_sqrt_grad_dx_warp128_fusion");
+      }
+    }
+    if (!EnvFlagEnabledLocal("MUSA_DISABLE_TF215_SGD_ASSIGN_ADD_FUSION")) {
+      const int tf215_sgd_rewrites = OptimizeTf215SgdAssignAdd(optimized_graph);
+      if (tf215_sgd_rewrites > 0) {
+        dumper.DumpAtStage(*optimized_graph,
+                           "after_tf215_sgd_assign_add_fusion");
+      }
+    }
+    if (!EnvFlagEnabledLocal("MUSA_DISABLE_TF215_MIXED_BF16_SGD_APPLY_FUSION")) {
+      const int mixed_bf16_sgd_rewrites =
+          OptimizeBFloat16GradientDescentCast(optimized_graph);
+      if (mixed_bf16_sgd_rewrites > 0) {
+        dumper.DumpAtStage(*optimized_graph,
+                           "after_tf215_mixed_bf16_sgd_apply_fusion");
+      }
+    }
+    if (!EnvFlagEnabledLocal("MUSA_DISABLE_TF215_SPARSE_SGD_ASSIGN_ADD_FUSION")) {
+      const int tf215_sparse_sgd_rewrites =
+          OptimizeTf215SparseSgdAssignAdd(optimized_graph);
+      if (tf215_sparse_sgd_rewrites > 0) {
+        dumper.DumpAtStage(*optimized_graph,
+                           "after_tf215_sparse_sgd_assign_add_fusion");
+      }
+    }
+    if (!EnvFlagEnabledLocal("MUSA_DISABLE_TF215_MIXED_BF16_SPARSE_SGD_FUSION")) {
+      const int mixed_bf16_sparse_sgd_rewrites =
+          OptimizeBFloat16SparseSgdScatter(optimized_graph);
+      if (mixed_bf16_sparse_sgd_rewrites > 0) {
+        dumper.DumpAtStage(*optimized_graph,
+                           "after_tf215_mixed_bf16_sparse_sgd_fusion");
+      }
     }
     if (configs_.optimizer_remove_ios_node != TriState::kOff) {
       const int removed_isolated_nodes = RemoveIsolatedNodes(optimized_graph);

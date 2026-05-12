@@ -9,6 +9,10 @@
 extern "C" {
 void LaunchMusaGeluGradFloat(const float* x, const float* dy, float* dx,
                              int n, musaStream_t stream);
+void LaunchMusaGeluGradBFloat16(const tensorflow::bfloat16* x,
+                                const tensorflow::bfloat16* dy,
+                                tensorflow::bfloat16* dx, int n,
+                                musaStream_t stream);
 }
 
 namespace tensorflow {
@@ -68,8 +72,10 @@ class MusaGeluGradOp : public MusaOpKernel {
   void Compute(OpKernelContext* ctx) override {
     const Tensor& x = ctx->input(0);
     const Tensor& dy = ctx->input(1);
-    OP_REQUIRES(ctx, x.dtype() == DT_FLOAT && dy.dtype() == DT_FLOAT,
-                errors::InvalidArgument("MusaGeluGrad expects float inputs"));
+    OP_REQUIRES(ctx, x.dtype() == dy.dtype() &&
+                         (x.dtype() == DT_FLOAT || x.dtype() == DT_BFLOAT16),
+                errors::InvalidArgument(
+                    "MusaGeluGrad expects float/bfloat16 inputs"));
     OP_REQUIRES(ctx, x.shape() == dy.shape(),
                 errors::InvalidArgument("MusaGeluGrad x/dy shape mismatch"));
 
@@ -79,10 +85,16 @@ class MusaGeluGradOp : public MusaOpKernel {
     if (num_elements == 0) return;
 
     auto& handle = GetHandleByCtx(ctx);
-    LaunchMusaGeluGradFloat(
-        x.flat<float>().data(), dy.flat<float>().data(),
-        dx->flat<float>().data(), static_cast<int>(num_elements),
-        reinterpret_cast<musaStream_t>(handle.GetStream()));
+    musaStream_t stream = reinterpret_cast<musaStream_t>(handle.GetStream());
+    if (x.dtype() == DT_FLOAT) {
+      LaunchMusaGeluGradFloat(
+          x.flat<float>().data(), dy.flat<float>().data(),
+          dx->flat<float>().data(), static_cast<int>(num_elements), stream);
+    } else {
+      LaunchMusaGeluGradBFloat16(
+          x.flat<bfloat16>().data(), dy.flat<bfloat16>().data(),
+          dx->flat<bfloat16>().data(), static_cast<int>(num_elements), stream);
+    }
     const auto status = musaGetLastError();
     OP_REQUIRES(ctx, status == musaSuccess,
                 errors::Internal("MusaGeluGrad kernel failed: ",
@@ -102,9 +114,15 @@ REGISTER_MUSA_GELU(bfloat16);
 
 #undef REGISTER_MUSA_GELU
 
-REGISTER_KERNEL_BUILDER(
-    Name("MusaGeluGrad").Device("MUSA").TypeConstraint<float>("T"),
-    MusaGeluGradOp);
+#define REGISTER_MUSA_GELU_GRAD(TYPE)                                 \
+  REGISTER_KERNEL_BUILDER(                                            \
+      Name("MusaGeluGrad").Device("MUSA").TypeConstraint<TYPE>("T"),  \
+      MusaGeluGradOp);
+
+REGISTER_MUSA_GELU_GRAD(float);
+REGISTER_MUSA_GELU_GRAD(bfloat16);
+
+#undef REGISTER_MUSA_GELU_GRAD
 
 }  // namespace musa
 
@@ -122,7 +140,7 @@ REGISTER_OP("MusaGeluGrad")
     .Input("x: T")
     .Input("dy: T")
     .Output("dx: T")
-    .Attr("T: {float}")
+    .Attr("T: {float, bfloat16}")
     .SetShapeFn([](::tensorflow::shape_inference::InferenceContext* c) {
       c->set_output(0, c->input(0));
       return ::tensorflow::OkStatus();

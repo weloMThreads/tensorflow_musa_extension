@@ -4,6 +4,7 @@
 
 #include "../utils_op.h"
 #include "mu/device/musa_memcpy.h"
+#include "tensorflow/core/framework/bfloat16.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
@@ -17,6 +18,11 @@ void LaunchConcatWithSliceGradFloat(const float* slice_grad,
                                     float* output, int outer, int axis_dim,
                                     int slice_start, int inner_dim,
                                     musaStream_t stream);
+void LaunchConcatWithSliceGradBFloat16(const void* slice_grad,
+                                       const void* input1, const void* input2,
+                                       void* output, int outer, int axis_dim,
+                                       int slice_start, int inner_dim,
+                                       musaStream_t stream);
 }
 
 namespace tensorflow {
@@ -167,10 +173,17 @@ class MusaConcatWithSliceGradOp : public MusaOpKernel {
 
     auto& handle = GetHandleByCtx(ctx);
     musaStream_t stream = reinterpret_cast<musaStream_t>(handle.GetStream());
-    LaunchConcatWithSliceGradFloat(
-        slice_grad.flat<float>().data(), input1.flat<float>().data(),
-        input2.flat<float>().data(), output->flat<float>().data(),
-        static_cast<int>(outer), axis_dim_, slice_start_, inner_dim_, stream);
+    if (output->dtype() == DT_FLOAT) {
+      LaunchConcatWithSliceGradFloat(
+          slice_grad.flat<float>().data(), input1.flat<float>().data(),
+          input2.flat<float>().data(), output->flat<float>().data(),
+          static_cast<int>(outer), axis_dim_, slice_start_, inner_dim_, stream);
+    } else {
+      LaunchConcatWithSliceGradBFloat16(
+          slice_grad.flat<bfloat16>().data(), input1.flat<bfloat16>().data(),
+          input2.flat<bfloat16>().data(), output->flat<bfloat16>().data(),
+          static_cast<int>(outer), axis_dim_, slice_start_, inner_dim_, stream);
+    }
     musaError_t err = musaGetLastError();
     OP_REQUIRES(ctx, err == musaSuccess,
                 errors::Internal("MusaConcatWithSliceGrad launch failed: ",
@@ -199,6 +212,20 @@ REGISTER_KERNEL_BUILDER(Name("ConcatV2")
 
 REGISTER_KERNEL_BUILDER(Name("ConcatV2")
                             .Device("MUSA")
+                            .TypeConstraint<bfloat16>("T")
+                            .TypeConstraint<int32>("Tidx")
+                            .HostMemory("axis"),
+                        MusaConcatOp<bfloat16, int32>);
+
+REGISTER_KERNEL_BUILDER(Name("ConcatV2")
+                            .Device("MUSA")
+                            .TypeConstraint<bfloat16>("T")
+                            .TypeConstraint<int64>("Tidx")
+                            .HostMemory("axis"),
+                        MusaConcatOp<bfloat16, int64>);
+
+REGISTER_KERNEL_BUILDER(Name("ConcatV2")
+                            .Device("MUSA")
                             .TypeConstraint<int32>("T")
                             .TypeConstraint<int32>("Tidx")
                             .HostMemory("axis"),
@@ -215,6 +242,10 @@ REGISTER_KERNEL_BUILDER(Name("MusaConcatWithSliceGrad")
                             .Device("MUSA")
                             .TypeConstraint<float>("T"),
                         MusaConcatWithSliceGradOp);
+REGISTER_KERNEL_BUILDER(Name("MusaConcatWithSliceGrad")
+                            .Device("MUSA")
+                            .TypeConstraint<bfloat16>("T"),
+                        MusaConcatWithSliceGradOp);
 
 }  // namespace musa
 
@@ -223,7 +254,7 @@ REGISTER_OP("MusaConcatWithSliceGrad")
     .Input("input1: T")
     .Input("input2: T")
     .Output("output: T")
-    .Attr("T: {float}")
+    .Attr("T: {float, bfloat16}")
     .Attr("axis_dim: int")
     .Attr("slice_start: int")
     .Attr("inner_dim: int")

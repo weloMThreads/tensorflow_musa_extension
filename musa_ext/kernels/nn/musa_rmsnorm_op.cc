@@ -1,6 +1,7 @@
 #include <vector>
 
 #include "../utils_op.h"
+#include "tensorflow/core/framework/bfloat16.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/shape_inference.h"
@@ -12,15 +13,26 @@ extern "C" {
 void LaunchRmsNormFloat(const float* x, const float* gamma, float* y,
                         float* normalized, float* inv_rms, int64_t num_rows,
                         int64_t row_size, float epsilon, musaStream_t stream);
+void LaunchRmsNormBFloat16(
+    const tensorflow::bfloat16* x, const tensorflow::bfloat16* gamma,
+    tensorflow::bfloat16* y, tensorflow::bfloat16* normalized,
+    tensorflow::bfloat16* inv_rms, int64_t num_rows, int64_t row_size,
+    float epsilon, musaStream_t stream);
 void LaunchRmsNormGradDxFloat(const float* x, const float* inv_rms,
                               const float* gamma, const float* dy,
                               float* dx, int64_t num_rows,
                               int64_t row_size, musaStream_t stream);
+void LaunchRmsNormGradDxBFloat16(
+    const tensorflow::bfloat16* x, const tensorflow::bfloat16* inv_rms,
+    const tensorflow::bfloat16* gamma, const tensorflow::bfloat16* dy,
+    tensorflow::bfloat16* dx, int64_t num_rows, int64_t row_size,
+    musaStream_t stream);
 }
 
 namespace tensorflow {
 namespace musa {
 
+template <typename T>
 class MusaRmsNormOp : public MusaOpKernel {
  public:
   explicit MusaRmsNormOp(OpKernelConstruction* ctx) : MusaOpKernel(ctx) {
@@ -62,11 +74,20 @@ class MusaRmsNormOp : public MusaOpKernel {
     auto& handle = GetHandleByCtx(ctx);
     musaStream_t stream = reinterpret_cast<musaStream_t>(handle.GetStream());
 
-    LaunchRmsNormFloat(x.flat<float>().data(), gamma.flat<float>().data(),
-                       y->flat<float>().data(),
-                       normalized->flat<float>().data(),
-                       inv_rms->flat<float>().data(), num_rows, row_size,
-                       epsilon_, stream);
+    if (x.dtype() == DT_FLOAT) {
+      LaunchRmsNormFloat(x.flat<float>().data(), gamma.flat<float>().data(),
+                         y->flat<float>().data(),
+                         normalized->flat<float>().data(),
+                         inv_rms->flat<float>().data(), num_rows, row_size,
+                         epsilon_, stream);
+    } else {
+      LaunchRmsNormBFloat16(x.flat<bfloat16>().data(),
+                            gamma.flat<bfloat16>().data(),
+                            y->flat<bfloat16>().data(),
+                            normalized->flat<bfloat16>().data(),
+                            inv_rms->flat<bfloat16>().data(), num_rows,
+                            row_size, epsilon_, stream);
+    }
   }
 
  private:
@@ -74,6 +95,7 @@ class MusaRmsNormOp : public MusaOpKernel {
 };
 
 
+template <typename T>
 class MusaRmsNormGradDxOp : public MusaOpKernel {
  public:
   explicit MusaRmsNormGradDxOp(OpKernelConstruction* ctx) : MusaOpKernel(ctx) {}
@@ -86,9 +108,11 @@ class MusaRmsNormGradDxOp : public MusaOpKernel {
     const Tensor& gamma = ctx->input(2);
     const Tensor& dy = ctx->input(3);
 
-    OP_REQUIRES(ctx, x.dtype() == DT_FLOAT && inv_rms.dtype() == DT_FLOAT &&
-                         gamma.dtype() == DT_FLOAT && dy.dtype() == DT_FLOAT,
-                errors::InvalidArgument("MusaRmsNormGradDx expects float inputs"));
+    OP_REQUIRES(ctx, x.dtype() == inv_rms.dtype() && x.dtype() == gamma.dtype() &&
+                         x.dtype() == dy.dtype() &&
+                         (x.dtype() == DT_FLOAT || x.dtype() == DT_BFLOAT16),
+                errors::InvalidArgument(
+                    "MusaRmsNormGradDx expects float/bfloat16 inputs"));
     OP_REQUIRES(ctx, x.shape() == dy.shape(),
                 errors::InvalidArgument("MusaRmsNormGradDx x/dy shape mismatch"));
     OP_REQUIRES(ctx, gamma.dims() == 1,
@@ -106,21 +130,33 @@ class MusaRmsNormGradDxOp : public MusaOpKernel {
     if (x.NumElements() == 0) return;
 
     auto& handle = GetHandleByCtx(ctx);
-    LaunchRmsNormGradDxFloat(
-        x.flat<float>().data(), inv_rms.flat<float>().data(),
-        gamma.flat<float>().data(), dy.flat<float>().data(),
-        dx->flat<float>().data(), num_rows, row_size,
-        reinterpret_cast<musaStream_t>(handle.GetStream()));
+    musaStream_t stream = reinterpret_cast<musaStream_t>(handle.GetStream());
+    if (x.dtype() == DT_FLOAT) {
+      LaunchRmsNormGradDxFloat(
+          x.flat<float>().data(), inv_rms.flat<float>().data(),
+          gamma.flat<float>().data(), dy.flat<float>().data(),
+          dx->flat<float>().data(), num_rows, row_size, stream);
+    } else {
+      LaunchRmsNormGradDxBFloat16(
+          x.flat<bfloat16>().data(), inv_rms.flat<bfloat16>().data(),
+          gamma.flat<bfloat16>().data(), dy.flat<bfloat16>().data(),
+          dx->flat<bfloat16>().data(), num_rows, row_size, stream);
+    }
   }
 };
 
-REGISTER_KERNEL_BUILDER(
-    Name("MusaRmsNorm").Device("MUSA").TypeConstraint<float>("T"),
-    MusaRmsNormOp);
+#define REGISTER_MUSA_RMSNORM(TYPE)                                      \
+  REGISTER_KERNEL_BUILDER(                                               \
+      Name("MusaRmsNorm").Device("MUSA").TypeConstraint<TYPE>("T"),      \
+      MusaRmsNormOp<TYPE>);                                              \
+  REGISTER_KERNEL_BUILDER(                                               \
+      Name("MusaRmsNormGradDx").Device("MUSA").TypeConstraint<TYPE>("T"), \
+      MusaRmsNormGradDxOp<TYPE>);
 
-REGISTER_KERNEL_BUILDER(
-    Name("MusaRmsNormGradDx").Device("MUSA").TypeConstraint<float>("T"),
-    MusaRmsNormGradDxOp);
+REGISTER_MUSA_RMSNORM(float);
+REGISTER_MUSA_RMSNORM(bfloat16);
+
+#undef REGISTER_MUSA_RMSNORM
 
 }  // namespace musa
 
@@ -130,7 +166,7 @@ REGISTER_OP("MusaRmsNormGradDx")
     .Input("gamma: T")
     .Input("dy: T")
     .Output("dx: T")
-    .Attr("T: {float}")
+    .Attr("T: {float, bfloat16}")
     .SetShapeFn([](::tensorflow::shape_inference::InferenceContext* c) {
       c->set_output(0, c->input(0));
       return ::tensorflow::OkStatus();
@@ -142,7 +178,7 @@ REGISTER_OP("MusaRmsNorm")
     .Output("y: T")
     .Output("normalized: T")
     .Output("inv_rms: T")
-    .Attr("T: {float}")
+    .Attr("T: {float, bfloat16}")
     .Attr("epsilon: float = 0.00001")
     .SetShapeFn([](::tensorflow::shape_inference::InferenceContext* c) {
       ::tensorflow::shape_inference::ShapeHandle x = c->input(0);

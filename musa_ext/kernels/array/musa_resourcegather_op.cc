@@ -15,9 +15,11 @@
 
 #include "../utils_op.h"
 #include "tensorflow/core/framework/bfloat16.h"
+#include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/resource_mgr.h"
 #include "tensorflow/core/framework/resource_var.h"
+#include "tensorflow/core/framework/shape_inference.h"
 #include "tensorflow/core/platform/logging.h"
 
 // ============================================================================
@@ -76,6 +78,22 @@ void LaunchResourceGatherHalfInt64(const void* params, const int64_t* indices,
                                    int64_t inner_size, int64_t indices_size,
                                    int64_t params_stride, int64_t limit,
                                    musaStream_t stream);
+void LaunchResourceGatherBFloat16Int32(
+    const void* params, const int* indices, void* output, int64_t batch_size,
+    int64_t inner_size, int64_t indices_size, int64_t params_stride, int limit,
+    musaStream_t stream);
+void LaunchResourceGatherBFloat16Int64(
+    const void* params, const int64_t* indices, void* output,
+    int64_t batch_size, int64_t inner_size, int64_t indices_size,
+    int64_t params_stride, int64_t limit, musaStream_t stream);
+void LaunchResourceScatterSubBFloat16Int32(
+    float* params, const int* indices, const void* updates, float alpha,
+    int64_t indices_size, int64_t inner_size, int64_t limit,
+    musaStream_t stream);
+void LaunchResourceScatterSubBFloat16Int64(
+    float* params, const int64_t* indices, const void* updates, float alpha,
+    int64_t indices_size, int64_t inner_size, int64_t limit,
+    musaStream_t stream);
 }
 
 namespace tensorflow {
@@ -206,6 +224,31 @@ DEFINE_RESOURCE_GATHER_LAUNCHER(int64, int64, LaunchResourceGatherInt64Int64)
 DEFINE_RESOURCE_GATHER_LAUNCHER_HALF(int32, LaunchResourceGatherHalfInt32)
 DEFINE_RESOURCE_GATHER_LAUNCHER_HALF(int64, LaunchResourceGatherHalfInt64)
 
+// BFloat16 specialization uses the same 16-bit gather ABI as half.
+template <>
+void MusaResourceGatherOp<Eigen::bfloat16, int32>::LaunchKernel(
+    const Eigen::bfloat16* params, const int32* indices,
+    Eigen::bfloat16* output, int64_t batch_size, int64_t inner_size,
+    int64_t indices_size, int64_t params_stride, int32 limit,
+    musaStream_t stream) {
+  LaunchResourceGatherBFloat16Int32(
+      reinterpret_cast<const void*>(params), indices,
+      reinterpret_cast<void*>(output), batch_size, inner_size, indices_size,
+      params_stride, limit, stream);
+}
+
+template <>
+void MusaResourceGatherOp<Eigen::bfloat16, int64>::LaunchKernel(
+    const Eigen::bfloat16* params, const int64* indices,
+    Eigen::bfloat16* output, int64_t batch_size, int64_t inner_size,
+    int64_t indices_size, int64_t params_stride, int64 limit,
+    musaStream_t stream) {
+  LaunchResourceGatherBFloat16Int64(
+      reinterpret_cast<const void*>(params), indices,
+      reinterpret_cast<void*>(output), batch_size, inner_size, indices_size,
+      params_stride, limit, stream);
+}
+
 #undef DEFINE_RESOURCE_GATHER_LAUNCHER
 #undef DEFINE_RESOURCE_GATHER_LAUNCHER_HALF
 
@@ -247,6 +290,91 @@ class MusaResourceScatterAddOp : public MusaOpKernel {
     }
   }
 };
+
+REGISTER_OP("MusaResourceScatterSubBFloat16")
+    .Input("resource: resource")
+    .Input("indices: Tindices")
+    .Input("updates: Tgrad")
+    .Input("alpha: T")
+    .Attr("T: {float}")
+    .Attr("Tgrad: {bfloat16}")
+    .Attr("Tindices: {int32, int64}")
+    .SetIsStateful()
+    .SetShapeFn(shape_inference::NoOutputs);
+
+template <typename Index>
+class MusaResourceScatterSubBFloat16Op : public MusaOpKernel {
+ public:
+  using MusaOpKernel::MusaOpKernel;
+  bool IsExpensive() override { return true; }
+
+  void Compute(OpKernelContext* c) override {
+    core::RefCountPtr<Var> v;
+    OP_REQUIRES_OK(c, LookupResource(c, HandleFromInput(c, 0), &v));
+    mutex_lock ml(*v->mu());
+    OP_REQUIRES(c, v->tensor()->IsInitialized(),
+                errors::FailedPrecondition("Variable not initialized."));
+
+    Tensor* params = v->tensor();
+    const Tensor& indices = c->input(1);
+    const Tensor& updates = c->input(2);
+    const Tensor& alpha = c->input(3);
+
+    OP_REQUIRES(c, params->dtype() == DT_FLOAT,
+                errors::InvalidArgument(
+                    "MusaResourceScatterSubBFloat16 expects float resource"));
+    OP_REQUIRES(c, updates.dtype() == DT_BFLOAT16,
+                errors::InvalidArgument(
+                    "MusaResourceScatterSubBFloat16 expects bfloat16 updates"));
+    OP_REQUIRES(c, alpha.NumElements() == 1,
+                errors::InvalidArgument("alpha must be a scalar, got ",
+                                        alpha.NumElements(), " elements"));
+    OP_REQUIRES(c, params->dims() >= 1,
+                errors::InvalidArgument("resource must be at least 1D"));
+
+    const int64_t indices_size = indices.NumElements();
+    if (indices_size == 0 || updates.NumElements() == 0) return;
+
+    const int64_t limit = params->dim_size(0);
+    const int64_t inner_size = params->NumElements() / limit;
+    OP_REQUIRES(c, updates.NumElements() == indices_size * inner_size,
+                errors::InvalidArgument(
+                    "updates shape does not match indices/resource. updates: ",
+                    updates.shape().DebugString(),
+                    " indices: ", indices.shape().DebugString(),
+                    " resource: ", params->shape().DebugString()));
+
+    musaStream_t stream = GetMusaStreamByCtx(c);
+    LaunchKernel(params->flat<float>().data(), indices.flat<Index>().data(),
+                 reinterpret_cast<const void*>(updates.flat<bfloat16>().data()),
+                 alpha.scalar<float>()(), indices_size, inner_size, limit,
+                 stream);
+  }
+
+ private:
+  void LaunchKernel(float* params, const Index* indices, const void* updates,
+                    float alpha, int64_t indices_size, int64_t inner_size,
+                    int64_t limit, musaStream_t stream);
+};
+
+template <>
+void MusaResourceScatterSubBFloat16Op<int32>::LaunchKernel(
+    float* params, const int32* indices, const void* updates, float alpha,
+    int64_t indices_size, int64_t inner_size, int64_t limit,
+    musaStream_t stream) {
+  LaunchResourceScatterSubBFloat16Int32(
+      params, indices, updates, alpha, indices_size, inner_size, limit, stream);
+}
+
+template <>
+void MusaResourceScatterSubBFloat16Op<int64>::LaunchKernel(
+    float* params, const int64* indices, const void* updates, float alpha,
+    int64_t indices_size, int64_t inner_size, int64_t limit,
+    musaStream_t stream) {
+  LaunchResourceScatterSubBFloat16Int64(
+      params, reinterpret_cast<const int64_t*>(indices), updates, alpha,
+      indices_size, inner_size, limit, stream);
+}
 
 // ============================================================================
 // AssignUpdateVariable Op
@@ -347,9 +475,23 @@ class MusaVariableShapeOp : public OpKernel {
 
 REGISTER_MUSA_KERNELS(float);
 REGISTER_MUSA_KERNELS(Eigen::half);
+REGISTER_MUSA_KERNELS(Eigen::bfloat16);
 REGISTER_MUSA_KERNELS(double);
 REGISTER_MUSA_KERNELS(int32);
 REGISTER_MUSA_KERNELS(int64);
+
+#define REGISTER_MUSA_SCATTER_SUB_BFLOAT16(type)                     \
+  REGISTER_KERNEL_BUILDER(Name("MusaResourceScatterSubBFloat16")      \
+                              .Device(DEVICE_MTGPU)                  \
+                              .HostMemory("resource")                \
+                              .HostMemory("alpha")                   \
+                              .TypeConstraint<float>("T")            \
+                              .TypeConstraint<bfloat16>("Tgrad")     \
+                              .TypeConstraint<type>("Tindices"),     \
+                          MusaResourceScatterSubBFloat16Op<type>);
+
+REGISTER_MUSA_SCATTER_SUB_BFLOAT16(int32);
+REGISTER_MUSA_SCATTER_SUB_BFLOAT16(int64);
 
 #define REGISTER_MUSA_ASSIGN_UPDATE_VARIABLE_KERNELS(type)   \
   REGISTER_KERNEL_BUILDER(                                   \
@@ -365,8 +507,6 @@ REGISTER_MUSA_KERNELS(int64);
           .TypeConstraint<type>("dtype"),                    \
       MusaAssignUpdateVariableOp<type, mBinary::Mode::ADD>);
 
-REGISTER_MUSA_ASSIGN_UPDATE_VARIABLE_KERNELS(Eigen::bfloat16);
-
 REGISTER_KERNEL_BUILDER(Name("VariableShape")
                             .Device(DEVICE_MTGPU)
                             .HostMemory("input")
@@ -374,6 +514,7 @@ REGISTER_KERNEL_BUILDER(Name("VariableShape")
                         MusaVariableShapeOp);
 
 #undef REGISTER_MUSA_KERNELS
+#undef REGISTER_MUSA_SCATTER_SUB_BFLOAT16
 #undef REGISTER_MUSA_ASSIGN_UPDATE_VARIABLE_KERNELS
 
 }  // namespace musa

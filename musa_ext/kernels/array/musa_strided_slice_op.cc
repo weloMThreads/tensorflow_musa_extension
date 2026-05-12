@@ -201,6 +201,7 @@ class MusaStridedSliceOp : public OpKernel {
                           MusaStridedSliceOp<T>)
 
 REGISTER_STRIDED_SLICE_MUSA(float);
+REGISTER_STRIDED_SLICE_MUSA(int32);
 REGISTER_STRIDED_SLICE_MUSA(int64);
 REGISTER_STRIDED_SLICE_MUSA(Eigen::half);
 REGISTER_STRIDED_SLICE_MUSA(Eigen::bfloat16);

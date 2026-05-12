@@ -351,6 +351,47 @@ void LaunchAddNWithSliceGradFloat(InlinePointers base_inputs,
       slice_start, inner_dim);
 }
 
+__global__ void AddNWithSliceGradKernelBFloat16(
+    InlinePointers base_inputs, const __mt_bfloat16* __restrict__ slice_grad,
+    __mt_bfloat16* __restrict__ output, int num_base_inputs, int size,
+    int axis_dim, int slice_start, int inner_dim) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= size) return;
+
+  float sum = 0.0f;
+  for (int i = 0; i < num_base_inputs; ++i) {
+    sum += __bfloat162float(
+        static_cast<const __mt_bfloat16*>(base_inputs.ptrs[i])[idx]);
+  }
+
+  const int inner_idx = idx % inner_dim;
+  const int axis_idx = (idx / inner_dim) % axis_dim;
+  if (axis_idx >= slice_start) {
+    const int outer_idx = idx / (axis_dim * inner_dim);
+    const int slice_axis_idx = axis_idx - slice_start;
+    const int slice_axis_dim = axis_dim - slice_start;
+    const int slice_idx =
+        (outer_idx * slice_axis_dim + slice_axis_idx) * inner_dim + inner_idx;
+    sum += __bfloat162float(slice_grad[slice_idx]);
+  }
+
+  output[idx] = __float2bfloat16(sum);
+}
+
+void LaunchAddNWithSliceGradBFloat16(InlinePointers base_inputs,
+                                     const void* slice_grad, void* output,
+                                     int num_base_inputs, int size,
+                                     int axis_dim, int slice_start,
+                                     int inner_dim, musaStream_t stream) {
+  if (size <= 0) return;
+  const int threads_per_block = 256;
+  const int blocks = (size + threads_per_block - 1) / threads_per_block;
+  AddNWithSliceGradKernelBFloat16<<<blocks, threads_per_block, 0, stream>>>(
+      base_inputs, reinterpret_cast<const __mt_bfloat16*>(slice_grad),
+      reinterpret_cast<__mt_bfloat16*>(output), num_base_inputs, size,
+      axis_dim, slice_start, inner_dim);
+}
+
 __global__ void ConcatWithSliceGradKernelFloat(
     const float* __restrict__ slice_grad, const float* __restrict__ input1,
     const float* __restrict__ input2, float* __restrict__ output, int outer,
@@ -390,6 +431,52 @@ void LaunchConcatWithSliceGradFloat(const float* slice_grad,
   const int blocks = (size + threads_per_block - 1) / threads_per_block;
   ConcatWithSliceGradKernelFloat<<<blocks, threads_per_block, 0, stream>>>(
       slice_grad, input1, input2, output, outer, axis_dim, slice_start,
+      inner_dim);
+}
+
+__global__ void ConcatWithSliceGradKernelBFloat16(
+    const __mt_bfloat16* __restrict__ slice_grad,
+    const __mt_bfloat16* __restrict__ input1,
+    const __mt_bfloat16* __restrict__ input2,
+    __mt_bfloat16* __restrict__ output, int outer, int axis_dim,
+    int slice_start, int inner_dim) {
+  const int size = outer * axis_dim * inner_dim;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= size) return;
+
+  const int inner_idx = idx % inner_dim;
+  const int axis_idx = (idx / inner_dim) % axis_dim;
+  const int outer_idx = idx / (axis_dim * inner_dim);
+  const int out_idx = (outer_idx * axis_dim + axis_idx) * inner_dim * 3 +
+                      inner_idx;
+
+  if (axis_idx < slice_start) {
+    output[out_idx] = __float2bfloat16(0.0f);
+  } else {
+    const int slice_axis_dim = axis_dim - slice_start;
+    const int slice_idx =
+        (outer_idx * slice_axis_dim + (axis_idx - slice_start)) *
+            inner_dim +
+        inner_idx;
+    output[out_idx] = slice_grad[slice_idx];
+  }
+  output[out_idx + inner_dim] = input1[idx];
+  output[out_idx + inner_dim * 2] = input2[idx];
+}
+
+void LaunchConcatWithSliceGradBFloat16(
+    const void* slice_grad, const void* input1, const void* input2,
+    void* output, int outer, int axis_dim, int slice_start, int inner_dim,
+    musaStream_t stream) {
+  const int size = outer * axis_dim * inner_dim;
+  if (size <= 0) return;
+  const int threads_per_block = 256;
+  const int blocks = (size + threads_per_block - 1) / threads_per_block;
+  ConcatWithSliceGradKernelBFloat16<<<blocks, threads_per_block, 0, stream>>>(
+      reinterpret_cast<const __mt_bfloat16*>(slice_grad),
+      reinterpret_cast<const __mt_bfloat16*>(input1),
+      reinterpret_cast<const __mt_bfloat16*>(input2),
+      reinterpret_cast<__mt_bfloat16*>(output), outer, axis_dim, slice_start,
       inner_dim);
 }
 

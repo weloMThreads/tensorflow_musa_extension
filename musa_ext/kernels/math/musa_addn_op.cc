@@ -46,6 +46,11 @@ void LaunchAddNWithSliceGradFloat(InlinePointers base_inputs,
                                   int num_base_inputs, int size, int axis_dim,
                                   int slice_start, int inner_dim,
                                   musaStream_t stream);
+void LaunchAddNWithSliceGradBFloat16(InlinePointers base_inputs,
+                                     const void* slice_grad, void* output,
+                                     int num_base_inputs, int size,
+                                     int axis_dim, int slice_start,
+                                     int inner_dim, musaStream_t stream);
 }
 
 namespace tensorflow {
@@ -344,11 +349,20 @@ class MusaAddNWithSliceGradOp : public MusaOpKernel {
     const Tensor& slice_grad = ctx->input(num_base_inputs_);
 
     auto& handle = GetHandleByCtx(ctx);
-    LaunchAddNWithSliceGradFloat(
-        base_inputs, slice_grad.flat<float>().data(),
-        output->flat<float>().data(), num_base_inputs_,
-        static_cast<int>(output->NumElements()), axis_dim_, slice_start_,
-        inner_dim_, reinterpret_cast<musaStream_t>(handle.GetStream()));
+    musaStream_t stream = reinterpret_cast<musaStream_t>(handle.GetStream());
+    if (output->dtype() == DT_FLOAT) {
+      LaunchAddNWithSliceGradFloat(
+          base_inputs, slice_grad.flat<float>().data(),
+          output->flat<float>().data(), num_base_inputs_,
+          static_cast<int>(output->NumElements()), axis_dim_, slice_start_,
+          inner_dim_, stream);
+    } else {
+      LaunchAddNWithSliceGradBFloat16(
+          base_inputs, slice_grad.flat<bfloat16>().data(),
+          output->flat<bfloat16>().data(), num_base_inputs_,
+          static_cast<int>(output->NumElements()), axis_dim_, slice_start_,
+          inner_dim_, stream);
+    }
   }
 
  private:
@@ -410,6 +424,10 @@ REGISTER_KERNEL_BUILDER(Name("MusaAddNWithSliceGrad")
                             .Device("MUSA")
                             .TypeConstraint<float>("T"),
                         MusaAddNWithSliceGradOp);
+REGISTER_KERNEL_BUILDER(Name("MusaAddNWithSliceGrad")
+                            .Device("MUSA")
+                            .TypeConstraint<bfloat16>("T"),
+                        MusaAddNWithSliceGradOp);
 
 }  // namespace musa
 
@@ -419,7 +437,7 @@ REGISTER_OP("MusaAddNWithSliceGrad")
     .Input("slice_grad: T")
     .Output("output: T")
     .Attr("N: int >= 1")
-    .Attr("T: {float}")
+    .Attr("T: {float, bfloat16}")
     .Attr("axis_dim: int")
     .Attr("slice_start: int")
     .Attr("inner_dim: int")
