@@ -12,13 +12,15 @@ namespace {
 
 extern "C" void LaunchMusaCausalAttentionForwardFloat(
     const float* query, const float* key, const float* value, const float* scale,
-    float* softmax, float* output, int64_t groups, int query_dim, int key_dim,
-    int head_dim, musaStream_t stream);
+    float* softmax, float* output, bool store_softmax, int64_t groups,
+    int query_dim, int key_dim, int head_dim, musaStream_t stream);
 
 class MusaCausalAttentionForwardOp : public MusaOpKernel {
  public:
   explicit MusaCausalAttentionForwardOp(OpKernelConstruction* ctx)
-      : MusaOpKernel(ctx) {}
+      : MusaOpKernel(ctx) {
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("store_softmax", &store_softmax_));
+  }
 
   bool IsExpensive() override { return true; }
 
@@ -72,14 +74,18 @@ class MusaCausalAttentionForwardOp : public MusaOpKernel {
         query.flat<float>().data(), key.flat<float>().data(),
         value.flat<float>().data(), scale.flat<float>().data(),
         softmax->flat<float>().data(), output->flat<float>().data(),
-        batch * heads, static_cast<int>(query_dim), static_cast<int>(key_dim),
-        static_cast<int>(head_dim), GetMusaStreamByCtx(ctx));
+        store_softmax_, batch * heads, static_cast<int>(query_dim),
+        static_cast<int>(key_dim), static_cast<int>(head_dim),
+        GetMusaStreamByCtx(ctx));
     const auto status = musaGetLastError();
     OP_REQUIRES(ctx, status == musaSuccess,
                 errors::Internal(
                     "MusaCausalAttentionForward kernel failed: ",
                     musaGetErrorString(status)));
   }
+
+ private:
+  bool store_softmax_ = true;
 };
 
 REGISTER_KERNEL_BUILDER(Name("MusaCausalAttentionForward").Device("MUSA"),
@@ -95,6 +101,7 @@ REGISTER_OP("MusaCausalAttentionForward")
     .Input("scale: float")
     .Output("softmax: float")
     .Output("output: float")
+    .Attr("store_softmax: bool = true")
     .SetShapeFn([](::tensorflow::shape_inference::InferenceContext* c) {
       ::tensorflow::shape_inference::ShapeHandle query;
       ::tensorflow::shape_inference::ShapeHandle key;

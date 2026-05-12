@@ -2101,6 +2101,16 @@ int OptimizeCausalAttentionGrad(GraphDef* graph) {
     RedirectDataConsumersToInput(graph, dv_bmm->name(), fused_name + ":2",
                                  fused_name);
 
+    if (softmax->op() == "MusaCausalAttentionForward") {
+      for (int j = 0; j < graph->node_size(); ++j) {
+        NodeDef* maybe_forward = graph->mutable_node(j);
+        if (maybe_forward->name() == softmax->name()) {
+          (*maybe_forward->mutable_attr())["store_softmax"].set_b(false);
+          break;
+        }
+      }
+    }
+
     remove_names.insert(ds_bmm->name());
     remove_names.insert(softmax_grad.name());
     remove_names.insert(scale_mul->name());

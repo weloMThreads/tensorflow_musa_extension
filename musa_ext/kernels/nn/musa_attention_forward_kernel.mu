@@ -30,8 +30,8 @@ __device__ __forceinline__ float WarpReduceSum(float value) {
 __global__ void CausalAttentionForwardDh8FloatKernel(
     const float* __restrict__ query, const float* __restrict__ key,
     const float* __restrict__ value, const float* __restrict__ scale_ptr,
-    float* __restrict__ softmax, float* __restrict__ output, int64_t groups,
-    int query_dim, int key_dim) {
+    float* __restrict__ softmax, float* __restrict__ output,
+    bool store_softmax, int64_t groups, int query_dim, int key_dim) {
   const int lane = threadIdx.x;
   const int row_in_block = threadIdx.y;
   const int query_idx = static_cast<int>(blockIdx.x) * blockDim.y + row_in_block;
@@ -82,8 +82,10 @@ __global__ void CausalAttentionForwardDh8FloatKernel(
   const float p0 = e0 * inv_sum;
   const float p1 = e1 * inv_sum;
 
-  if (key_idx0 < key_dim) softmax[softmax_base + key_idx0] = p0;
-  if (key_idx1 < key_dim) softmax[softmax_base + key_idx1] = p1;
+  if (store_softmax) {
+    if (key_idx0 < key_dim) softmax[softmax_base + key_idx0] = p0;
+    if (key_idx1 < key_dim) softmax[softmax_base + key_idx1] = p1;
+  }
 
   const float* value_base = value + group * static_cast<int64_t>(key_dim) * kHeadDim;
   float partial0 = 0.0f;
@@ -142,8 +144,8 @@ __global__ void CausalAttentionForwardDh8FloatKernel(
 
 extern "C" void LaunchMusaCausalAttentionForwardFloat(
     const float* query, const float* key, const float* value, const float* scale,
-    float* softmax, float* output, int64_t groups, int query_dim, int key_dim,
-    int head_dim, musaStream_t stream) {
+    float* softmax, float* output, bool store_softmax, int64_t groups,
+    int query_dim, int key_dim, int head_dim, musaStream_t stream) {
   if (groups <= 0 || query_dim <= 0 || key_dim <= 0 || head_dim != 8 ||
       query_dim > key_dim || key_dim > 64) {
     return;
@@ -151,7 +153,8 @@ extern "C" void LaunchMusaCausalAttentionForwardFloat(
   const dim3 block(kWarpSize, kRowsPerBlock, 1);
   const dim3 grid((query_dim + kRowsPerBlock - 1) / kRowsPerBlock, groups, 1);
   CausalAttentionForwardDh8FloatKernel<<<grid, block, 0, stream>>>(
-      query, key, value, scale, softmax, output, groups, query_dim, key_dim);
+      query, key, value, scale, softmax, output, store_softmax, groups,
+      query_dim, key_dim);
 }
 
 }  // namespace musa
