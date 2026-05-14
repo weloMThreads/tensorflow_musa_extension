@@ -96,6 +96,36 @@ __global__ void RandomUniformKernel(int64_t n, MusaPhiloxState state, T* output)
     }
 }
 
+__device__ __forceinline__ bool Uint32ToRealGreaterEqual(
+    uint32_t x, uint32_t threshold_bits) {
+    return (x & 0x7fffffu) >= threshold_bits;
+}
+
+__global__ void RandomUniformGreaterEqualKernel(int64_t n,
+                                                MusaPhiloxState state,
+                                                uint32_t threshold_bits,
+                                                bool* output) {
+    const int kGroupSize = 4;
+    const int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_thread_count = gridDim.x * blockDim.x;
+
+    uint4_ ctr = {state.counter[0], state.counter[1], state.counter[2], state.counter[3]};
+    uint2_ key = {state.key[0], state.key[1]};
+
+    ctr = skip_philox(ctr, (uint64_t)thread_id);
+    int64_t offset = (int64_t)thread_id * kGroupSize;
+
+    while (offset < n) {
+        uint4_ res = ComputePhilox10(ctr, key);
+        if (offset < n) output[offset] = Uint32ToRealGreaterEqual(res.x, threshold_bits);
+        if (offset + 1 < n) output[offset + 1] = Uint32ToRealGreaterEqual(res.y, threshold_bits);
+        if (offset + 2 < n) output[offset + 2] = Uint32ToRealGreaterEqual(res.z, threshold_bits);
+        if (offset + 3 < n) output[offset + 3] = Uint32ToRealGreaterEqual(res.w, threshold_bits);
+        offset += (int64_t)total_thread_count * kGroupSize;
+        ctr = skip_philox(ctr, (uint64_t)total_thread_count);
+    }
+}
+
 template <typename T>
 __global__ void RandomUniformIntKernel(int64_t n, MusaPhiloxState state, T minval, T maxval, T* output) {
     const int kGroupSize = 4;
@@ -157,6 +187,9 @@ void LaunchRandomUniform_float(void* stream, int64_t n, int num_blocks, int bloc
 }
 void LaunchRandomUniform_double(void* stream, int64_t n, int num_blocks, int block_size, MusaPhiloxState state, double* output) {
     RandomUniformKernel<double><<<num_blocks, block_size, 0, (musaStream_t)stream>>>(n, state, output);
+}
+void LaunchRandomUniformGreaterEqual_bool(void* stream, int64_t n, int num_blocks, int block_size, MusaPhiloxState state, uint32_t threshold_bits, bool* output) {
+    RandomUniformGreaterEqualKernel<<<num_blocks, block_size, 0, (musaStream_t)stream>>>(n, state, threshold_bits, output);
 }
 void LaunchRandomUniformInt_int(void* stream, int64_t n, int num_blocks, int block_size, MusaPhiloxState state, int minval, int maxval, int* output) {
     RandomUniformIntKernel<int><<<num_blocks, block_size, 0, (musaStream_t)stream>>>(n, state, minval, maxval, output);

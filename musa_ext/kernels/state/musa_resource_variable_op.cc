@@ -5,12 +5,19 @@
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/framework/resource_mgr.h"
 #include "tensorflow/core/framework/resource_var.h"
+#include "tensorflow/core/framework/shape_inference.h"
 #include "tensorflow/core/lib/core/notification.h"
+
+#include <cstdlib>
+#include <string>
 
 namespace tensorflow {
 namespace musa {
 
 using Var = ::tensorflow::Var;
+
+extern "C" void LaunchFloatToBFloat16Copy(const float* src, void* dst,
+                                           int64_t n, musaStream_t stream);
 
 Status CopyTensorWithDeviceContext(OpKernelContext* ctx, const Tensor& src,
                                    Tensor* dst) {
@@ -197,11 +204,13 @@ class MusaReadVariableOp : public OpKernel {
             "Trying to read variable with wrong dtype. Expected ",
             DataTypeString(dtype_), " got ", DataTypeString(t.dtype())));
 
-    // Always copy the tensor to ensure the returned tensor is independent
-    // of the variable's underlying storage. This is critical for correct
-    // eager execution semantics where read_value() should return the value
-    // at the time of reading, not a reference that changes when the variable
-    // is modified.
+    const char* force_copy = std::getenv("MUSA_READ_VARIABLE_FORCE_COPY");
+    if (force_copy == nullptr || std::string(force_copy) != "1") {
+      ctx->set_output(0, t);
+      return;
+    }
+
+    // Fallback copy path for debugging or workloads that require a snapshot.
     Tensor* out = nullptr;
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, t.shape(), &out));
 
@@ -220,6 +229,55 @@ class MusaReadVariableOp : public OpKernel {
   DataType dtype_;
 };
 
+REGISTER_OP("MusaReadVariableFloatToBFloat16")
+    .Input("resource: resource")
+    .Output("value: bfloat16")
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      c->set_output(0, c->UnknownShape());
+      return OkStatus();
+    });
+
+class MusaReadVariableFloatToBFloat16Op : public OpKernel {
+ public:
+  explicit MusaReadVariableFloatToBFloat16Op(OpKernelConstruction* ctx)
+      : OpKernel(ctx) {}
+
+  bool IsExpensive() override { return false; }
+
+  void Compute(OpKernelContext* ctx) override {
+    core::RefCountPtr<Var> var;
+    const Tensor& handle_tensor = ctx->input(0);
+    const ResourceHandle& handle = handle_tensor.flat<ResourceHandle>()(0);
+
+    Status s = LookupResource(ctx, handle, &var);
+    if (!s.ok()) {
+      ctx->CtxFailure(s);
+      return;
+    }
+
+    tf_shared_lock lock(*var->mu());
+    if (!var->is_initialized) {
+      ctx->CtxFailure(errors::FailedPrecondition("Variable not initialized."));
+      return;
+    }
+
+    const Tensor& t = *var->tensor();
+    OP_REQUIRES(ctx, t.dtype() == DT_FLOAT,
+                errors::InvalidArgument(
+                    "MusaReadVariableFloatToBFloat16 expects float variable"));
+
+    Tensor* out = nullptr;
+    OP_REQUIRES_OK(ctx, ctx->allocate_output(0, t.shape(), &out));
+    if (t.NumElements() == 0) return;
+
+    LaunchFloatToBFloat16Copy(t.flat<float>().data(),
+                              reinterpret_cast<void*>(
+                                  out->flat<bfloat16>().data()),
+                              static_cast<int64_t>(t.NumElements()),
+                              GetMusaStreamByCtx(ctx));
+  }
+};
+
 REGISTER_KERNEL_BUILDER(
     Name("ReadVariableOp").Device("MUSA").HostMemory("resource"),
     MusaReadVariableOp);
@@ -227,6 +285,11 @@ REGISTER_KERNEL_BUILDER(
 REGISTER_KERNEL_BUILDER(
     Name("ResourceReadVariableOp").Device("MUSA").HostMemory("resource"),
     MusaReadVariableOp);
+
+REGISTER_KERNEL_BUILDER(Name("MusaReadVariableFloatToBFloat16")
+                            .Device("MUSA")
+                            .HostMemory("resource"),
+                        MusaReadVariableFloatToBFloat16Op);
 
 class MusaVarIsInitializedOp : public OpKernel {
  public:
