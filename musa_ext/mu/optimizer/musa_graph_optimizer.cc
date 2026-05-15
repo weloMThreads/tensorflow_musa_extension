@@ -4985,7 +4985,8 @@ int OptimizeRandomUniformGreaterEqual(GraphDef* graph) {
     const auto random_dtype_it = random->attr().find("dtype");
     const auto random_t_it = random->attr().find("T");
     if (random_dtype_it == random->attr().end() ||
-        random_dtype_it->second.type() != DT_FLOAT ||
+        (random_dtype_it->second.type() != DT_FLOAT &&
+         random_dtype_it->second.type() != DT_BFLOAT16) ||
         random_t_it == random->attr().end() ||
         random_t_it->second.type() != DT_INT32) {
       continue;
