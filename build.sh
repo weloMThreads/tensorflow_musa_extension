@@ -12,8 +12,8 @@ set -e
 #   ./build.sh wheel     # Build wheel package directly (recommended for distribution)
 # ============================================================================
 
-# Required TensorFlow version
-REQUIRED_TF_VERSION="2.15.0"
+# Required TensorFlow minor version
+REQUIRED_TF_VERSION_PREFIX="2.15."
 
 # Function to check TensorFlow version
 check_tf_version() {
@@ -21,12 +21,12 @@ check_tf_version() {
     python3 -c "
 import tensorflow as tf
 version = tf.__version__
-required = '${REQUIRED_TF_VERSION}'
-if version != required:
+required_prefix = '${REQUIRED_TF_VERSION_PREFIX}'
+if not version.startswith(required_prefix):
     print(f'ERROR: TensorFlow version mismatch!')
-    print(f'  Required: {required}')
+    print(f'  Required: {required_prefix}x')
     print(f'  Installed: {version}')
-    print(f'  Please install: pip install tensorflow=={required}')
+    print(f'  Please install: pip install \"tensorflow>=2.15,<2.16\"')
     exit(1)
 print(f'TensorFlow {version} found - OK')
 " || exit 1

@@ -37,8 +37,8 @@ RUNTIME_CONFIG_BINDINGS = "_runtime_config_bindings"
 RUNTIME_CONFIG_BINDINGS_PATTERN = f"{RUNTIME_CONFIG_BINDINGS}*.so"
 BUILD_DIR = "build"
 
-# Required TensorFlow version
-REQUIRED_TF_VERSION = "2.15.0"
+# Required TensorFlow minor version
+REQUIRED_TF_VERSION_PREFIX = "2.15."
 
 
 def check_tensorflow_version():
@@ -54,19 +54,19 @@ def check_tensorflow_version():
         import tensorflow as tf
         version = tf.__version__
 
-        if version != REQUIRED_TF_VERSION:
+        if not version.startswith(REQUIRED_TF_VERSION_PREFIX):
             print(f"ERROR: TensorFlow version mismatch!")
-            print(f"  Required: {REQUIRED_TF_VERSION}")
+            print(f"  Required: {REQUIRED_TF_VERSION_PREFIX}x")
             print(f"  Installed: {version}")
-            print(f"  Please install the correct version: pip install tensorflow=={REQUIRED_TF_VERSION}")
+            print('  Please install the correct version: pip install "tensorflow>=2.15,<2.16"')
             sys.exit(1)
 
         print(f"TensorFlow {version} found - OK")
         return True, version
     except ImportError:
         print(f"WARNING: TensorFlow not installed.")
-        print(f"  Required version: {REQUIRED_TF_VERSION}")
-        print(f"  Please install: pip install tensorflow=={REQUIRED_TF_VERSION}")
+        print(f"  Required version: {REQUIRED_TF_VERSION_PREFIX}x")
+        print('  Please install: pip install "tensorflow>=2.15,<2.16"')
         return False, None
 
 
