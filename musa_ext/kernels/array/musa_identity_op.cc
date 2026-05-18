@@ -37,6 +37,11 @@ class MusaIdentityOp : public OpKernel {
       MusaIdentityOp);                                           \
   REGISTER_KERNEL_BUILDER(                                       \
       Name("Snapshot").Device("MUSA").TypeConstraint<type>("T"), \
+      MusaIdentityOp);                                           \
+  REGISTER_KERNEL_BUILDER(                                       \
+      Name("_EagerConst")                                       \
+          .Device("MUSA")                                       \
+          .TypeConstraint<type>("T"),                           \
       MusaIdentityOp);
       
 REGISTER_MUSA_BASE_OPS(float);

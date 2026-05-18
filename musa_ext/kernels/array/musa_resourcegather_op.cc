@@ -102,6 +102,11 @@ void LaunchCriteoSparseEmbeddingGatherFloatInt32(
     const uintptr_t* params_ptrs, const int* limits, const int* indices,
     float* output, int batch_size, int feature_count, int inner_size,
     musaStream_t stream);
+
+void LaunchCriteoSparseEmbeddingGatherFloatToBFloat16Int32(
+    const uintptr_t* params_ptrs, const int* limits, const int* indices,
+    void* output, int batch_size, int feature_count, int inner_size,
+    musaStream_t stream);
 void LaunchResourceScatterSubBFloat16Int32(
     float* params, const int* indices, const void* updates, float alpha,
     int64_t indices_size, int64_t inner_size, int64_t limit,
@@ -352,8 +357,9 @@ class MusaResourceGatherFloatToBFloat16Op : public MusaOpKernel {
 REGISTER_OP("MusaCriteoSparseEmbeddingGather")
     .Input("resources: N * resource")
     .Input("indices: int32")
-    .Output("output: float")
+    .Output("output: Tout")
     .Attr("N: int")
+    .Attr("Tout: {float, bfloat16} = DT_FLOAT")
     .SetShapeFn([](shape_inference::InferenceContext* c) {
       c->set_output(0, c->UnknownShape());
       return OkStatus();
@@ -364,6 +370,7 @@ class MusaCriteoSparseEmbeddingGatherOp : public MusaOpKernel {
   explicit MusaCriteoSparseEmbeddingGatherOp(OpKernelConstruction* c)
       : MusaOpKernel(c), cache_initialized_(false) {
     OP_REQUIRES_OK(c, c->GetAttr("N", &feature_count_));
+    OP_REQUIRES_OK(c, c->GetAttr("Tout", &output_dtype_));
   }
 
   bool IsExpensive() override { return true; }
@@ -473,11 +480,21 @@ class MusaCriteoSparseEmbeddingGatherOp : public MusaOpKernel {
       }
     }
 
-    LaunchCriteoSparseEmbeddingGatherFloatInt32(
-        reinterpret_cast<const uintptr_t*>(device_ptrs_.flat<uint64>().data()),
-        device_limits_.flat<int32>().data(), indices.flat<int32>().data(),
-        output->flat<float>().data(), batch_size, feature_count_, inner_size,
-        stream);
+    if (output_dtype_ == DT_FLOAT) {
+      LaunchCriteoSparseEmbeddingGatherFloatInt32(
+          reinterpret_cast<const uintptr_t*>(
+              device_ptrs_.flat<uint64>().data()),
+          device_limits_.flat<int32>().data(), indices.flat<int32>().data(),
+          output->flat<float>().data(), batch_size, feature_count_,
+          inner_size, stream);
+    } else {
+      LaunchCriteoSparseEmbeddingGatherFloatToBFloat16Int32(
+          reinterpret_cast<const uintptr_t*>(
+              device_ptrs_.flat<uint64>().data()),
+          device_limits_.flat<int32>().data(), indices.flat<int32>().data(),
+          reinterpret_cast<void*>(output->flat<bfloat16>().data()), batch_size,
+          feature_count_, inner_size, stream);
+    }
     err = musaGetLastError();
     OP_REQUIRES(c, err == musaSuccess,
                 errors::Internal(
@@ -487,6 +504,7 @@ class MusaCriteoSparseEmbeddingGatherOp : public MusaOpKernel {
 
  private:
   int feature_count_ = 0;
+  DataType output_dtype_ = DT_FLOAT;
   bool cache_initialized_;
   Tensor device_ptrs_;
   Tensor device_limits_;

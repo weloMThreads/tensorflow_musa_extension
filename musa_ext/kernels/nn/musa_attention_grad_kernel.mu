@@ -149,7 +149,6 @@ __global__ void CausalAttentionGradDh8RecomputeKernel(
     const T* __restrict__ value, const T* __restrict__ scale_ptr,
     T* __restrict__ dquery, T* __restrict__ dkey,
     T* __restrict__ dvalue, int64_t groups, int query_dim, int key_dim) {
-  (void)softmax;
   const int64_t group = static_cast<int64_t>(blockIdx.x);
   if (group >= groups) return;
 
@@ -164,6 +163,8 @@ __global__ void CausalAttentionGradDh8RecomputeKernel(
   __shared__ float probs[kMaxRecomputeElems];
 
   const float scale = LoadValue(scale_ptr);
+  const int64_t softmax_base =
+      group * static_cast<int64_t>(query_dim) * key_dim;
   const int64_t q_base = group * static_cast<int64_t>(query_dim) * kValueDim;
   const int64_t k_base = group * static_cast<int64_t>(key_dim) * kValueDim;
   const int64_t v_base = k_base;
@@ -171,39 +172,16 @@ __global__ void CausalAttentionGradDh8RecomputeKernel(
   for (int q = warp_id; q < query_dim; q += kWarpsPerBlock) {
     const int last_unmasked_key = key_dim - query_dim + q;
     const int key_idx0 = lane;
-    const int key_idx1 = lane + kWarpSize;
     const int64_t q_off = q_base + static_cast<int64_t>(q) * kValueDim;
 
-    const float q0 = LoadValue(query + q_off + 0);
-    const float q1 = LoadValue(query + q_off + 1);
-    const float q2 = LoadValue(query + q_off + 2);
-    const float q3 = LoadValue(query + q_off + 3);
-    const float q4 = LoadValue(query + q_off + 4);
-    const float q5 = LoadValue(query + q_off + 5);
-    const float q6 = LoadValue(query + q_off + 6);
-    const float q7 = LoadValue(query + q_off + 7);
-
-    auto dot_key = [&](int key_idx) {
-      const T* key_ptr =
-          key + k_base + static_cast<int64_t>(key_idx) * kValueDim;
-      return (q0 * LoadValue(key_ptr + 0) + q1 * LoadValue(key_ptr + 1) +
-              q2 * LoadValue(key_ptr + 2) + q3 * LoadValue(key_ptr + 3) +
-              q4 * LoadValue(key_ptr + 4) + q5 * LoadValue(key_ptr + 5) +
-              q6 * LoadValue(key_ptr + 6) + q7 * LoadValue(key_ptr + 7)) *
-             scale;
-    };
-
     const bool valid0 = key_idx0 < key_dim && key_idx0 <= last_unmasked_key;
-    const bool valid1 = key_idx1 < key_dim && key_idx1 <= last_unmasked_key;
-    const float x0 = valid0 ? dot_key(key_idx0) : kNegInf;
-    const float x1 = valid1 ? dot_key(key_idx1) : kNegInf;
-    const float row_max = WarpReduceMax(fmaxf(x0, x1));
-    const float e0 = valid0 ? __expf(x0 - row_max) : 0.0f;
-    const float e1 = valid1 ? __expf(x1 - row_max) : 0.0f;
-    const float row_sum = WarpReduceSum(e0 + e1);
-    const float inv_sum = 1.0f / row_sum;
-    const float p0 = e0 * inv_sum;
-    const float p1 = e1 * inv_sum;
+    const int row_base = q * key_dim;
+    const int64_t softmax_row =
+        softmax_base + static_cast<int64_t>(row_base);
+    float p0 = 0.0f;
+    if (valid0) {
+      p0 = LoadValue(softmax + softmax_row + key_idx0);
+    }
 
     const T* dout_ptr = dout + q_off;
     auto dot_value = [&](int key_idx) {
@@ -219,19 +197,36 @@ __global__ void CausalAttentionGradDh8RecomputeKernel(
              LoadValue(dout_ptr + 7) * LoadValue(value_ptr + 7);
     };
 
-    const float ds0 = valid0 ? dot_value(key_idx0) : 0.0f;
-    const float ds1 = valid1 ? dot_value(key_idx1) : 0.0f;
-    const float row_dot = WarpReduceSum(ds0 * p0 + ds1 * p1);
-    const int row_base = q * key_dim;
+    float ds0 = 0.0f;
+    if (valid0) {
+      ds0 = dot_value(key_idx0);
+    }
+    float tail_row_dot = 0.0f;
+    if (lane == 0) {
+      for (int tail_key = kWarpSize; tail_key <= last_unmasked_key; ++tail_key) {
+        const float p = LoadValue(softmax + softmax_row + tail_key);
+        tail_row_dot += dot_value(tail_key) * p;
+      }
+    }
+    const float row_dot =
+        WarpReduceSum(ds0 * p0) + WarpReduceSum(tail_row_dot);
     if (key_idx0 < key_dim) {
       probs[row_base + key_idx0] = p0;
       dlogits[row_base + key_idx0] =
           valid0 ? (ds0 - row_dot) * p0 * scale : 0.0f;
     }
-    if (key_idx1 < key_dim) {
-      probs[row_base + key_idx1] = p1;
-      dlogits[row_base + key_idx1] =
-          valid1 ? (ds1 - row_dot) * p1 * scale : 0.0f;
+    if (lane == 0) {
+      for (int tail_key = kWarpSize; tail_key < key_dim; ++tail_key) {
+        float p = 0.0f;
+        float dlogit = 0.0f;
+        if (tail_key <= last_unmasked_key) {
+          p = LoadValue(softmax + softmax_row + tail_key);
+          const float ds = dot_value(tail_key);
+          dlogit = (ds - row_dot) * p * scale;
+        }
+        probs[row_base + tail_key] = p;
+        dlogits[row_base + tail_key] = dlogit;
+      }
     }
   }
   __syncthreads();

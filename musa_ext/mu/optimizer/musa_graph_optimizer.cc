@@ -666,7 +666,21 @@ void RemoveNodesByName(GraphDef* graph,
     if (remove_names.find(node.name()) != remove_names.end()) {
       continue;
     }
-    *kept.add_node() = node;
+    NodeDef* kept_node = kept.add_node();
+    *kept_node = node;
+
+    std::vector<string> inputs;
+    inputs.reserve(kept_node->input_size());
+    for (const auto& input : kept_node->input()) {
+      if (!input.empty() && input[0] == '^' &&
+          remove_names.find(NodeNameFromInputLocal(input)) !=
+              remove_names.end()) {
+        continue;
+      }
+      inputs.push_back(input);
+    }
+    kept_node->clear_input();
+    for (const auto& input : inputs) kept_node->add_input(input);
   }
   graph->Swap(&kept);
 }
@@ -1457,8 +1471,34 @@ int OptimizeTf215SgdLearningRateReadSharing(GraphDef* graph) {
     return it == node_index.end() ? nullptr : &graph->node(it->second);
   };
 
-  std::unordered_map<string, string> canonical_read_by_resource;
-  std::unordered_set<string> redirected_reads;
+  auto resolve_lr_resource = [&](const string& input,
+                                 string* resource_key) -> bool {
+    const NodeDef* lr = find_node(input);
+    for (int depth = 0; depth < 4 && lr != nullptr &&
+                        lr->op() == "Identity" && lr->input_size() >= 1;
+         ++depth) {
+      const auto type_it = lr->attr().find("T");
+      if (type_it == lr->attr().end() || type_it->second.type() != DT_FLOAT) {
+        return false;
+      }
+      lr = find_node(lr->input(0));
+    }
+
+    if (lr == nullptr || lr->op() != "ReadVariableOp" ||
+        lr->input_size() < 1) {
+      return false;
+    }
+    const auto dtype_it = lr->attr().find("dtype");
+    if (dtype_it == lr->attr().end() ||
+        dtype_it->second.type() != DT_FLOAT) {
+      return false;
+    }
+    *resource_key = NodeNameFromInputLocal(lr->input(0));
+    return !resource_key->empty();
+  };
+
+  std::unordered_map<string, string> canonical_input_by_resource;
+  std::unordered_set<string> redirected_lr_inputs;
   int rewrites = 0;
 
   for (int i = 0; i < graph->node_size(); ++i) {
@@ -1468,32 +1508,29 @@ int OptimizeTf215SgdLearningRateReadSharing(GraphDef* graph) {
       continue;
     }
 
-    const NodeDef* lr_read = find_node(node->input(1));
-    if (lr_read == nullptr || lr_read->op() != "ReadVariableOp" ||
-        lr_read->input_size() < 1 ||
-        lr_read->name().find("SGD/mul_") != 0 ||
-        lr_read->attr().find("dtype") == lr_read->attr().end() ||
-        lr_read->attr().at("dtype").type() != DT_FLOAT) {
+    string resource_key;
+    if (!resolve_lr_resource(node->input(1), &resource_key)) {
       continue;
     }
 
-    const string key = NodeNameFromInputLocal(lr_read->input(0));
     auto inserted =
-        canonical_read_by_resource.emplace(key, NodeNameFromInputLocal(node->input(1)));
+        canonical_input_by_resource.emplace(resource_key, node->input(1));
     if (inserted.second) {
       continue;
     }
 
-    const string& canonical_read = inserted.first->second;
-    if (canonical_read == NodeNameFromInputLocal(node->input(1))) {
+    const string old_input = node->input(1);
+    const string& canonical_input = inserted.first->second;
+    if (NodeNameFromInputLocal(old_input) ==
+        NodeNameFromInputLocal(canonical_input)) {
       continue;
     }
-    node->set_input(1, canonical_read);
-    redirected_reads.insert(lr_read->name());
+    node->set_input(1, canonical_input);
+    redirected_lr_inputs.insert(NodeNameFromInputLocal(old_input));
     ++rewrites;
   }
 
-  if (!redirected_reads.empty()) {
+  if (!redirected_lr_inputs.empty()) {
     std::unordered_set<string> referenced_nodes;
     referenced_nodes.reserve(graph->node_size());
     for (const auto& node : graph->node()) {
@@ -1503,7 +1540,7 @@ int OptimizeTf215SgdLearningRateReadSharing(GraphDef* graph) {
     }
 
     std::unordered_set<string> remove_names;
-    for (const string& name : redirected_reads) {
+    for (const string& name : redirected_lr_inputs) {
       if (referenced_nodes.find(name) == referenced_nodes.end()) {
         remove_names.insert(name);
       }
@@ -1860,6 +1897,36 @@ int OptimizeBFloat16GradientDescentCast(GraphDef* graph) {
     return it == node_map.end() ? nullptr : it->second;
   };
 
+  auto find_bfloat16_to_float_grad_cast =
+      [&](const string& input,
+          std::vector<string>* wrapper_names) -> const NodeDef* {
+    const NodeDef* node = find_node(input);
+    if (IsBFloat16ToFloatCast(node)) {
+      return node;
+    }
+    if (node == nullptr || node->input_size() < 1 ||
+        (node->op() != "Identity" && node->op() != "IdentityN")) {
+      return nullptr;
+    }
+
+    const NodeDef* cast = find_node(node->input(0));
+    if (!IsBFloat16ToFloatCast(cast)) {
+      return nullptr;
+    }
+
+    const string cast_name = cast->name();
+    for (const auto& wrapper_input : node->input()) {
+      if (!wrapper_input.empty() && wrapper_input[0] == '^') {
+        continue;
+      }
+      if (NodeNameFromInputLocal(wrapper_input) != cast_name) {
+        return nullptr;
+      }
+    }
+    wrapper_names->push_back(node->name());
+    return cast;
+  };
+
   std::unordered_set<string> remove_names;
   int rewrites = 0;
   const int original_node_size = graph->node_size();
@@ -1875,8 +1942,10 @@ int OptimizeBFloat16GradientDescentCast(GraphDef* graph) {
       continue;
     }
 
-    const NodeDef* grad_cast = find_node(apply.input(2));
-    if (!IsBFloat16ToFloatCast(grad_cast)) {
+    std::vector<string> grad_wrapper_names;
+    const NodeDef* grad_cast =
+        find_bfloat16_to_float_grad_cast(apply.input(2), &grad_wrapper_names);
+    if (grad_cast == nullptr) {
       continue;
     }
 
@@ -1905,6 +1974,15 @@ int OptimizeBFloat16GradientDescentCast(GraphDef* graph) {
         fused->add_input(input);
       }
     }
+    for (const string& wrapper_name : grad_wrapper_names) {
+      const NodeDef* wrapper = find_node(wrapper_name);
+      if (wrapper == nullptr) continue;
+      for (const auto& input : wrapper->input()) {
+        if (!input.empty() && input[0] == '^') {
+          add_input_if_missing(input);
+        }
+      }
+    }
     for (const auto& input : apply.input()) {
       if (!input.empty() && input[0] == '^') {
         add_input_if_missing(input);
@@ -1920,8 +1998,31 @@ int OptimizeBFloat16GradientDescentCast(GraphDef* graph) {
     RedirectNodeOutputs(graph, apply_name, fused_name);
     ReplaceNodeWithControlNoOp(graph->mutable_node(i), fused_name,
                                apply_device);
-    if (DataConsumerCount(*graph, grad_cast->name()) == 1) {
-      RedirectNodeOutputs(graph, grad_cast->name(), fused_name);
+    bool can_remove_wrappers = true;
+    int wrapper_inputs_from_grad_cast = 0;
+    for (const string& wrapper_name : grad_wrapper_names) {
+      const NodeDef* wrapper = find_node(wrapper_name);
+      if (wrapper == nullptr || DataConsumerCount(*graph, wrapper_name) != 1) {
+        can_remove_wrappers = false;
+        continue;
+      }
+      for (const auto& input : wrapper->input()) {
+        if (!input.empty() && input[0] == '^') continue;
+        if (NodeNameFromInputLocal(input) == grad_cast->name()) {
+          ++wrapper_inputs_from_grad_cast;
+        }
+      }
+      RedirectNodeOutputs(graph, wrapper_name, fused_name);
+      remove_names.insert(wrapper_name);
+    }
+    if (grad_wrapper_names.empty()) {
+      if (DataConsumerCount(*graph, grad_cast->name()) == 1) {
+        RedirectNodeOutputs(graph, grad_cast->name(), fused_name);
+        remove_names.insert(grad_cast->name());
+      }
+    } else if (can_remove_wrappers &&
+               DataConsumerCount(*graph, grad_cast->name()) ==
+                   wrapper_inputs_from_grad_cast) {
       remove_names.insert(grad_cast->name());
     }
     ++rewrites;
@@ -2380,6 +2481,12 @@ bool IsOneTrans3DEinsumEquation(const string& equation) {
          equation == "bte,btd->tde";
 }
 
+bool IsXlaDeviceModeEnabled() {
+  const char* flags = std::getenv("TF_XLA_FLAGS");
+  return flags != nullptr &&
+         string(flags).find("tf_xla_enable_xla_devices") != string::npos;
+}
+
 int OptimizeOneTrans3DEinsum(GraphDef* graph) {
   int rewrites = 0;
   for (int i = 0; i < graph->node_size(); ++i) {
@@ -2416,6 +2523,15 @@ int OptimizeCriteoSparseEmbeddingGatherPack(GraphDef* graph) {
     return it == node_map.end() ? nullptr : it->second;
   };
 
+  auto find_mutable_node = [&](const string& node_name) -> NodeDef* {
+    for (int node_idx = 0; node_idx < graph->node_size(); ++node_idx) {
+      NodeDef* node = graph->mutable_node(node_idx);
+      if (node->name() == node_name) return node;
+    }
+    return nullptr;
+  };
+
+  std::unordered_set<string> remove_names;
   int rewrites = 0;
   for (int i = 0; i < graph->node_size(); ++i) {
     NodeDef* pack = graph->mutable_node(i);
@@ -2424,23 +2540,41 @@ int OptimizeCriteoSparseEmbeddingGatherPack(GraphDef* graph) {
     const auto t_it = pack->attr().find("T");
     const auto axis_it = pack->attr().find("axis");
     const auto n_it = pack->attr().find("N");
-    if (t_it == pack->attr().end() || t_it->second.type() != DT_FLOAT ||
+    if (t_it == pack->attr().end() ||
+        (t_it->second.type() != DT_FLOAT &&
+         t_it->second.type() != DT_BFLOAT16) ||
         axis_it == pack->attr().end() || axis_it->second.i() != 1 ||
         n_it == pack->attr().end() || n_it->second.i() != 26) {
       continue;
     }
+    const DataType pack_dtype = t_it->second.type();
 
     std::vector<string> resource_inputs;
     resource_inputs.reserve(pack->input_size());
     string sparse_input;
+    std::vector<string> local_remove_names;
+    std::vector<string> local_control_noop_names;
     bool matched = true;
     for (int input_idx = 0; input_idx < pack->input_size(); ++input_idx) {
-      const NodeDef* identity = find_node(pack->input(input_idx));
-      const NodeDef* gather = identity;
-      if (identity != nullptr && identity->op() == "Identity" &&
-          identity->input_size() >= 1) {
-        gather = find_node(identity->input(0));
+      const NodeDef* input_node = find_node(pack->input(input_idx));
+      const NodeDef* cast = nullptr;
+      const NodeDef* identity = nullptr;
+      const NodeDef* gather = nullptr;
+
+      if (pack_dtype == DT_BFLOAT16) {
+        cast = input_node;
+        if (!IsFloatToBFloat16Cast(cast)) {
+          matched = false;
+          break;
+        }
+        input_node = find_node(cast->input(0));
       }
+      if (input_node != nullptr && input_node->op() == "Identity" &&
+          input_node->input_size() >= 1) {
+        identity = input_node;
+        input_node = find_node(identity->input(0));
+      }
+      gather = input_node;
       if (gather == nullptr || gather->op() != "ResourceGather" ||
           gather->input_size() < 2) {
         matched = false;
@@ -2480,6 +2614,19 @@ int OptimizeCriteoSparseEmbeddingGatherPack(GraphDef* graph) {
         break;
       }
 
+      if (cast != nullptr && DataConsumerCount(*graph, cast->name()) == 1) {
+        local_remove_names.push_back(cast->name());
+      }
+      if (identity != nullptr &&
+          DataConsumerCount(*graph, identity->name()) == 1) {
+        local_remove_names.push_back(identity->name());
+      }
+      if (DataConsumerCount(*graph, gather->name()) == 1) {
+        local_control_noop_names.push_back(gather->name());
+      }
+      if (DataConsumerCount(*graph, slice->name()) == 1) {
+        local_remove_names.push_back(slice->name());
+      }
       resource_inputs.push_back(gather->input(0));
     }
 
@@ -2500,12 +2647,21 @@ int OptimizeCriteoSparseEmbeddingGatherPack(GraphDef* graph) {
     pack->add_input(sparse_input);
     pack->mutable_attr()->clear();
     (*pack->mutable_attr())["N"].set_i(26);
+    (*pack->mutable_attr())["Tout"].set_type(pack_dtype);
     if (has_output_shapes) {
       (*pack->mutable_attr())["_output_shapes"] = output_shapes;
+    }
+    for (const string& name : local_control_noop_names) {
+      ReplaceNodeWithControlNoOp(find_mutable_node(name), pack->name(),
+                                 pack->device());
+    }
+    for (const string& name : local_remove_names) {
+      remove_names.insert(name);
     }
     rewrites++;
   }
 
+  RemoveNodesByName(graph, remove_names);
   if (rewrites > 0) {
     LOG(INFO) << "MusaGraphOptimizer: Rewrote " << rewrites
               << " Criteo sparse embedding gather Pack node(s)";
@@ -4656,8 +4812,9 @@ int OptimizeCausalAttentionGrad(GraphDef* graph) {
     const string fused_name = softmax_grad.name() + "/musa_causal_attention_grad";
     if (node_map.find(fused_name) != node_map.end()) continue;
     const string scale_input =
-        softmax->op() == "MusaCausalAttentionForward" ? softmax->input(3)
-                                                       : softmax->input(1);
+        NodeNameFromInputLocal(scale_mul->input(0)) == softmax_grad.name()
+            ? scale_mul->input(1)
+            : scale_mul->input(0);
 
     NodeDef* fused = graph->add_node();
     fused->set_name(fused_name);
@@ -4676,16 +4833,6 @@ int OptimizeCausalAttentionGrad(GraphDef* graph) {
                                  fused_name);
     RedirectDataConsumersToInput(graph, dv_bmm->name(), fused_name + ":2",
                                  fused_name);
-
-    if (softmax->op() == "MusaCausalAttentionForward") {
-      for (int j = 0; j < graph->node_size(); ++j) {
-        NodeDef* maybe_forward = graph->mutable_node(j);
-        if (maybe_forward->name() == softmax->name()) {
-          (*maybe_forward->mutable_attr())["store_softmax"].set_b(false);
-          break;
-        }
-      }
-    }
 
     remove_names.insert(ds_bmm->name());
     remove_names.insert(softmax_grad.name());
@@ -5404,6 +5551,7 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
         }
       }
     }
+
     return ::tensorflow::OkStatus();
   }
 
@@ -5577,7 +5725,8 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
       }
     }
 
-    if (!EnvFlagEnabledLocal("MUSA_DISABLE_CAUSAL_MASK_SOFTMAX_FUSION")) {
+    if (!EnvFlagEnabledLocal("MUSA_DISABLE_CAUSAL_MASK_SOFTMAX_FUSION") &&
+        !IsFusionPatternDisabled("causal_mask_softmax")) {
       const int causal_mask_softmax_rewrites =
           OptimizeCausalMaskedSoftmax(optimized_graph);
       if (causal_mask_softmax_rewrites > 0) {
@@ -5586,7 +5735,8 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
       }
     }
 
-    if (!EnvFlagEnabledLocal("MUSA_DISABLE_CAUSAL_ATTENTION_FORWARD_FUSION")) {
+    if (!EnvFlagEnabledLocal("MUSA_DISABLE_CAUSAL_ATTENTION_FORWARD_FUSION") &&
+        !IsFusionPatternDisabled("causal_attention_forward")) {
       const int causal_attention_forward_rewrites =
           OptimizeCausalAttentionForward(optimized_graph);
       if (causal_attention_forward_rewrites > 0) {
@@ -5595,7 +5745,8 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
       }
     }
 
-    if (!EnvFlagEnabledLocal("MUSA_DISABLE_SOFTMAX_GRAD_FUSION")) {
+    if (!EnvFlagEnabledLocal("MUSA_DISABLE_SOFTMAX_GRAD_FUSION") &&
+        !IsFusionPatternDisabled("softmax_grad")) {
       const int softmax_grad_rewrites =
           OptimizeSoftmaxGradSmallLastDim(optimized_graph);
       if (softmax_grad_rewrites > 0) {
@@ -5604,7 +5755,8 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
       }
     }
 
-    if (!EnvFlagEnabledLocal("MUSA_DISABLE_CAUSAL_ATTENTION_GRAD_FUSION")) {
+    if (!EnvFlagEnabledLocal("MUSA_DISABLE_CAUSAL_ATTENTION_GRAD_FUSION") &&
+        !IsFusionPatternDisabled("causal_attention_grad")) {
       const int causal_attention_grad_rewrites =
           OptimizeCausalAttentionGrad(optimized_graph);
       if (causal_attention_grad_rewrites > 0) {
@@ -5613,7 +5765,9 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
       }
     }
 
-    if (!EnvFlagEnabledLocal("MUSA_DISABLE_ONETRANS_3D_EINSUM_FUSION")) {
+    if (!EnvFlagEnabledLocal("MUSA_DISABLE_ONETRANS_3D_EINSUM_FUSION") &&
+        !IsFusionPatternDisabled("onetrans_3d_einsum") &&
+        !IsXlaDeviceModeEnabled()) {
       const int onetrans_3d_einsum_rewrites =
           OptimizeOneTrans3DEinsum(optimized_graph);
       if (onetrans_3d_einsum_rewrites > 0) {
@@ -5622,8 +5776,8 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
       }
     }
 
-    if (EnvFlagEnabledLocal("MUSA_ENABLE_CRITEO_SPARSE_GATHER_FUSION") &&
-        !EnvFlagEnabledLocal("MUSA_DISABLE_CRITEO_SPARSE_GATHER_FUSION")) {
+    if (!EnvFlagEnabledLocal("MUSA_DISABLE_CRITEO_SPARSE_GATHER_FUSION") &&
+        !IsFusionPatternDisabled("criteo_sparse_gather")) {
       const int criteo_sparse_gather_rewrites =
           OptimizeCriteoSparseEmbeddingGatherPack(optimized_graph);
       if (criteo_sparse_gather_rewrites > 0) {
@@ -6237,7 +6391,7 @@ class MusaAutoGraphOptimizationPass : public ::tensorflow::GraphOptimizationPass
     TF_RETURN_IF_ERROR(::tensorflow::ConvertGraphDefToGraph(
         constructor_opts, std::move(optimized_graph_def), new_graph.get()));
     options.graph->swap(new_graph);
-    LOG(INFO) << "MusaAutoGraphOptimizationPass applied to graph with "
+    VLOG(1) << "MusaAutoGraphOptimizationPass applied to graph with "
               << graph_def.node_size() << " node(s)";
     return ::tensorflow::OkStatus();
   }

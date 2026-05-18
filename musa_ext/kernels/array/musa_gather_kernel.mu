@@ -221,6 +221,35 @@ __global__ void CriteoSparseEmbeddingGatherKernel(
   output[tid] = table[static_cast<int64_t>(idx) * inner_size + inner_idx];
 }
 
+__global__ void CriteoSparseEmbeddingGatherFloatToBFloat16Kernel(
+    const uintptr_t* __restrict__ params_ptrs,
+    const int* __restrict__ limits,
+    const int* __restrict__ indices,
+    __mt_bfloat16* __restrict__ output,
+    int batch_size,
+    int feature_count,
+    int inner_size) {
+  const int64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t total_elements =
+      static_cast<int64_t>(batch_size) * feature_count * inner_size;
+  if (tid >= total_elements) return;
+
+  const int inner_idx = tid % inner_size;
+  const int feature_idx = (tid / inner_size) % feature_count;
+  const int batch_idx = tid / (inner_size * feature_count);
+
+  int idx = indices[batch_idx * feature_count + feature_idx];
+  const int limit = limits[feature_idx];
+  if (idx < 0) idx = 0;
+  if (idx >= limit) idx = limit - 1;
+
+  const float* table =
+      reinterpret_cast<const float*>(params_ptrs[feature_idx]);
+  output[tid] =
+      __float2bfloat16(table[static_cast<int64_t>(idx) * inner_size +
+                            inner_idx]);
+}
+
 // ============================================================================
 // Launcher Functions
 // ============================================================================
@@ -523,6 +552,21 @@ void LaunchCriteoSparseEmbeddingGatherFloatInt32(
       <<<blocks, OPTIMAL_THREADS, 0, stream>>>(
           params_ptrs, limits, indices, output, batch_size, feature_count,
           inner_size);
+}
+
+void LaunchCriteoSparseEmbeddingGatherFloatToBFloat16Int32(
+    const uintptr_t* params_ptrs, const int* limits, const int* indices,
+    void* output, int batch_size, int feature_count, int inner_size,
+    musaStream_t stream) {
+  const int64_t total_elements =
+      static_cast<int64_t>(batch_size) * feature_count * inner_size;
+  if (total_elements == 0) return;
+  const int blocks = OPTIMAL_BLOCKS(total_elements);
+  CriteoSparseEmbeddingGatherFloatToBFloat16Kernel
+      <<<blocks, OPTIMAL_THREADS, 0, stream>>>(
+          params_ptrs, limits, indices,
+          reinterpret_cast<__mt_bfloat16*>(output), batch_size,
+          feature_count, inner_size);
 }
 
 __global__ void ResourceScatterSubBFloat16Int32Kernel(
