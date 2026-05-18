@@ -5776,7 +5776,8 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
       }
     }
 
-    if (!EnvFlagEnabledLocal("MUSA_DISABLE_CRITEO_SPARSE_GATHER_FUSION") &&
+    if (EnvFlagEnabledLocal("MUSA_ENABLE_CRITEO_SPARSE_GATHER_FUSION") &&
+        !EnvFlagEnabledLocal("MUSA_DISABLE_CRITEO_SPARSE_GATHER_FUSION") &&
         !IsFusionPatternDisabled("criteo_sparse_gather")) {
       const int criteo_sparse_gather_rewrites =
           OptimizeCriteoSparseEmbeddingGatherPack(optimized_graph);
