@@ -1,7 +1,11 @@
 #include <musa_runtime.h>
 
+#include <cstdlib>
+#include <string>
+
 #include "musa_executor.h"
 #include "xla/stream_executor/executor_cache.h"
+#include "tensorflow/core/platform/logging.h"
 #include "tsl/platform/errors.h"
 #include "tsl/platform/statusor.h"
 #include "xla/stream_executor/multi_platform_manager.h"
@@ -68,7 +72,26 @@ class MusaPlatform : public Platform {
   ExecutorCache executor_cache_;
 };
 
+static bool EnvFlagEnabled(const char* value) {
+  if (value == nullptr) return false;
+  const std::string flag(value);
+  return flag == "1" || flag == "true" || flag == "TRUE" ||
+         flag == "yes" || flag == "YES";
+}
+
 static void InitializeMusaPlatform() {
+  if (EnvFlagEnabled(std::getenv("TF_MUSA_SKIP_PLATFORM_REGISTRATION"))) {
+    LOG(INFO) << "Skipping MUSA platform registration because "
+              << "TF_MUSA_SKIP_PLATFORM_REGISTRATION is enabled";
+    return;
+  }
+
+  auto existing = MultiPlatformManager::PlatformWithName("MUSA");
+  if (existing.ok()) {
+    LOG(INFO) << "MUSA platform already registered; skipping plugin platform registration";
+    return;
+  }
+
   std::unique_ptr<Platform> platform(new MusaPlatform);
   TF_CHECK_OK(MultiPlatformManager::RegisterPlatform(std::move(platform)));
 }
